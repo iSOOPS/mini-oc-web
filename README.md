@@ -1,6 +1,6 @@
 # mini-oc-web
 
-A Rust BFF (Axum) + Vue 3 SPA portal for browsing mini-oc-gui (oc serve) sessions across devices.
+A Rust BFF (Axum) + Vue 3 SPA (placeholder — full UI in follow-up PR) for browsing mini-oc-gui (oc serve) sessions across devices.
 
 ## Quick Start
 
@@ -28,7 +28,7 @@ open http://127.0.0.1:8100
 docker build -t mini-oc-web .
 
 # Run with docker compose
-docker compose up
+docker compose up -d
 ```
 
 ## Documentation

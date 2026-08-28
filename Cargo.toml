@@ -3,6 +3,8 @@ name = "mini-oc-web"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.83"
+description = "BFF + SPA portal for browsing mini-oc-gui sessions and deep-linking into oc web"
+license = "MIT"
 
 [[bin]]
 name = "mini-oc-web"
@@ -24,7 +26,7 @@ base64 = "0.22"
 urlencoding = "2"
 hmac = "0.12"
 sha2 = "0.10"
-rand = "0.8"
+rand = "=0.8.5"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 thiserror = "1"
@@ -37,4 +39,4 @@ dotenvy = "0.15"
 tokio = { version = "1", features = ["full", "test-util"] }
 mockito = "1"
 wiremock = "0.6"
-serial_test = "3"
+serial_test = "=3.1.1"
