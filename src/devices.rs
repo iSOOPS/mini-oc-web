@@ -70,6 +70,12 @@ impl DevicesCache {
                 *self.state.lock().unwrap() = Some((now, df.clone()));
                 return Ok(df);
             }
+            Err(AppError::ServiceUnavailable(msg)) => {
+                return Err(AppError::ServiceUnavailable(format!(
+                    "devices cache unavailable: {}",
+                    msg
+                )));
+            }
             Err(e) => return Err(e),
         };
         let df: DevicesFile = serde_json::from_str(&body)

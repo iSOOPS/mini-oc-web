@@ -17,6 +17,8 @@ pub enum AppError {
     NotFound(String),
     #[error("rate limited")]
     RateLimited,
+    #[error("service unavailable: {0}")]
+    ServiceUnavailable(String),
     #[error("internal: {0}")]
     Internal(String),
 }
@@ -30,6 +32,7 @@ pub enum ErrorCode {
     DeviceOffline,
     NotFound,
     RateLimited,
+    ServiceUnavailable,
     Internal,
 }
 
@@ -43,6 +46,7 @@ impl ErrorCode {
             ErrorCode::DeviceOffline => "device_offline",
             ErrorCode::NotFound => "not_found",
             ErrorCode::RateLimited => "rate_limited",
+            ErrorCode::ServiceUnavailable => "service_unavailable",
             ErrorCode::Internal => "internal",
         }
     }
@@ -58,6 +62,7 @@ impl AppError {
             AppError::DeviceOffline(_) => ErrorCode::DeviceOffline,
             AppError::NotFound(_) => ErrorCode::NotFound,
             AppError::RateLimited => ErrorCode::RateLimited,
+            AppError::ServiceUnavailable(_) => ErrorCode::ServiceUnavailable,
             AppError::Internal(_) => ErrorCode::Internal,
         }
     }
@@ -69,6 +74,7 @@ impl AppError {
             AppError::DeviceAuthFailed(_) | AppError::DeviceOffline(_) => 502,
             AppError::NotFound(_) => 404,
             AppError::RateLimited => 429,
+            AppError::ServiceUnavailable(_) => 503,
             AppError::Internal(_) => 500,
         }
     }

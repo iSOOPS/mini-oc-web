@@ -2,6 +2,14 @@ use crate::error::{AppError, AppResult};
 use reqwest::Client;
 use std::sync::Mutex;
 
+fn map_reqwest_error(ctx: &str, e: reqwest::Error) -> AppError {
+    if e.is_connect() || e.is_timeout() || e.is_request() {
+        AppError::ServiceUnavailable(format!("{}: {}", ctx, e))
+    } else {
+        AppError::Internal(format!("{}: {}", ctx, e))
+    }
+}
+
 #[derive(Debug)]
 pub struct SbClient {
     base_url: String,
@@ -37,7 +45,7 @@ impl SbClient {
             .basic_auth(&self.username, Some(&self.password))
             .send()
             .await
-            .map_err(|e| AppError::Internal(format!("sb login: {}", e)))?;
+            .map_err(|e| map_reqwest_error("sb login", e))?;
         if !resp.status().is_success() {
             return Err(AppError::Internal(format!("sb login status: {}", resp.status())));
         }
@@ -59,7 +67,7 @@ impl SbClient {
         let resp = req
             .send()
             .await
-            .map_err(|e| AppError::Internal(format!("sb get_fs: {}", e)))?;
+            .map_err(|e| map_reqwest_error("sb get_fs", e))?;
         let status = resp.status();
         if status == reqwest::StatusCode::NOT_FOUND {
             return Err(AppError::NotFound(path.to_string()));
@@ -67,7 +75,7 @@ impl SbClient {
         if !status.is_success() {
             return Err(AppError::Internal(format!("sb get_fs status: {}", status)));
         }
-        resp.text().await.map_err(|e| AppError::Internal(format!("sb get_fs body: {}", e)))
+        resp.text().await.map_err(|e| map_reqwest_error("sb get_fs body", e))
     }
 
     pub async fn put_fs(&self, path: &str, body: &str) -> AppResult<()> {
@@ -79,7 +87,7 @@ impl SbClient {
         let resp = req
             .send()
             .await
-            .map_err(|e| AppError::Internal(format!("sb put_fs: {}", e)))?;
+            .map_err(|e| map_reqwest_error("sb put_fs", e))?;
         if !resp.status().is_success() {
             return Err(AppError::Internal(format!("sb put_fs status: {}", resp.status())));
         }

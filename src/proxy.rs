@@ -64,7 +64,13 @@ impl DeviceClient {
             .basic_auth(&self.username, Some(&self.password))
             .send()
             .await
-            .map_err(|e| AppError::Internal(format!("device {}: {}", path, e)))?;
+            .map_err(|e| {
+                if e.is_connect() || e.is_timeout() || e.is_request() {
+                    AppError::DeviceOffline(format!("{} {}: {}", self.base_url, path, e))
+                } else {
+                    AppError::Internal(format!("device {} {}: {}", self.base_url, path, e))
+                }
+            })?;
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             return Err(AppError::DeviceAuthFailed(format!(

@@ -38,3 +38,21 @@ fn device_key_is_pctype_slash_pcname() {
     };
     assert_eq!(d.key(), "windows/YG-PC");
 }
+
+#[test]
+fn serializes_and_round_trips_back() {
+    let original = DevicesFile {
+        version: 1,
+        devices: vec![Device {
+            pctype: "macos".to_string(),
+            pcname: "samuel".to_string(),
+            public_url: "https://oc-mac.isoops.com".to_string(),
+            oc_serve_port: 9464,
+            reported_at: Some("2026-08-28T10:00:00+08:00".to_string()),
+            version: Some("0.1.0".to_string()),
+        }],
+    };
+    let json = serde_json::to_string(&original).unwrap();
+    let parsed: DevicesFile = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed, original);
+}

@@ -18,6 +18,7 @@ fn error_codes_match_design_doc() {
     assert_eq!(ErrorCode::NotFound.as_str(), "not_found");
     assert_eq!(ErrorCode::RateLimited.as_str(), "rate_limited");
     assert_eq!(ErrorCode::Internal.as_str(), "internal");
+    assert_eq!(ErrorCode::ServiceUnavailable.as_str(), "service_unavailable");
 }
 
 #[test]
@@ -30,4 +31,16 @@ fn error_status_codes_match_spec() {
     assert_eq!(AppError::NotFound("x".into()).status(), 404);
     assert_eq!(AppError::RateLimited.status(), 429);
     assert_eq!(AppError::Internal("x".into()).status(), 500);
+    assert_eq!(AppError::ServiceUnavailable("x".into()).status(), 503);
+}
+
+#[test]
+fn service_unavailable_serializes_correctly() {
+    let err = AppError::ServiceUnavailable("SB unreachable".into());
+    let json = serde_json::to_value(&err).unwrap();
+    assert_eq!(json["error"]["code"], "service_unavailable");
+    assert_eq!(
+        json["error"]["message"],
+        "service unavailable: SB unreachable"
+    );
 }
