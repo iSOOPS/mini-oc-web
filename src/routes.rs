@@ -11,14 +11,17 @@ use axum::response::{IntoResponse, Redirect};
 use axum::routing::{get, post};
 use axum::{Json as AxumJson, Router};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tower::service_fn;
+use tower_http::services::ServeDir;
 
 const COOKIE_NAME: &str = "mini_oc_web_session";
 const COOKIE_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 
 pub fn build_router(state: AppState) -> Router {
-    Router::new()
+    let api = Router::new()
         .route("/healthz", get(healthz))
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
@@ -37,8 +40,39 @@ pub fn build_router(state: AppState) -> Router {
             get(device_jump),
         )
         .route("/api/manual/:device_id/sessions", post(manual_create_session))
-        .fallback(static_handler)
-        .with_state(Arc::new(state))
+        .with_state(Arc::new(state.clone()));
+
+    let static_dir: PathBuf = state.config.web_static_dir.clone().into();
+    let index_html = static_dir.join("index.html");
+
+    let spa_fallback = service_fn(move |_req: axum::extract::Request| {
+        let index_html = index_html.clone();
+        async move {
+            Ok::<_, std::convert::Infallible>(
+                match tokio::fs::read(&index_html).await {
+                    Ok(bytes) => (
+                        StatusCode::OK,
+                        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                        bytes,
+                    )
+                        .into_response(),
+                    Err(_) => spa_missing_placeholder().await.into_response(),
+                }
+            )
+        }
+    });
+
+    let serve_dir = ServeDir::new(&static_dir).fallback(spa_fallback);
+
+    api.fallback_service(serve_dir)
+}
+
+async fn spa_missing_placeholder() -> impl IntoResponse {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        r#"<!doctype html><html><body><h1>mini-oc-web</h1><p>SPA not built. Run <code>cd web &amp;&amp; npm install &amp;&amp; npm run build</code> first.</p></body></html>"#,
+    )
 }
 
 fn extract_ip(headers: &HeaderMap) -> String {
@@ -341,13 +375,4 @@ async fn device_jump(
         return Ok(AxumJson(serde_json::json!({"jump_url": url})).into_response());
     }
     Ok(Redirect::to(&url).into_response())
-}
-
-async fn static_handler(_uri: axum::http::Uri) -> impl IntoResponse {
-    let body = r#"<!doctype html><html><body><h1>mini-oc-web</h1><p>SPA placeholder. Build web/dist for full UI.</p></body></html>"#;
-    (
-        StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        body,
-    )
 }
