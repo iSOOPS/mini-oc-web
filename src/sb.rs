@@ -54,7 +54,7 @@ impl SbClient {
         let url = format!("{}/.fs/{}", self.base_url, path.trim_start_matches('/'));
         let mut req = self.http.get(&url);
         if let Some(c) = self.cookie() {
-            req = req.header("::cookie", c);
+            req = req.header("cookie", c);
         }
         let resp = req
             .send()
@@ -74,7 +74,7 @@ impl SbClient {
         let url = format!("{}/.fs/{}", self.base_url, path.trim_start_matches('/'));
         let mut req = self.http.put(&url).body(body.to_string());
         if let Some(c) = self.cookie() {
-            req = req.header("::cookie", c);
+            req = req.header("cookie", c);
         }
         let resp = req
             .send()
