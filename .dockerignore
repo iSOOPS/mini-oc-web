@@ -1,0 +1,12 @@
+/target
+.git
+.gitignore
+.env
+.env.local
+/data
+*.log
+.DS_Store
+node_modules
+web/dist/*
+!web/dist/.gitkeep
+tests/
