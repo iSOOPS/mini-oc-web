@@ -3,4 +3,5 @@ pub mod config_md;
 pub mod devices;
 pub mod error;
 pub mod jump;
+pub mod proxy;
 pub mod sb;
