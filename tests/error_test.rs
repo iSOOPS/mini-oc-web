@@ -5,7 +5,7 @@ fn error_serializes_to_unified_shape() {
     let err = AppError::Unauthorized("bad credentials".into());
     let json = serde_json::to_value(&err).unwrap();
     assert_eq!(json["error"]["code"], "unauthorized");
-    assert_eq!(json["error"]["message"], "bad credentials");
+    assert_eq!(json["error"]["message"], "unauthorized: bad credentials");
 }
 
 #[test]

@@ -3,7 +3,7 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum AppError {
-    #[error("{0}")]
+    #[error("unauthorized: {0}")]
     Unauthorized(String),
     #[error("invalid pcname: {0}")]
     InvalidPcname(String),
