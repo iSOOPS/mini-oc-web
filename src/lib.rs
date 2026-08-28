@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod config_md;
+pub mod devices;
 pub mod error;
 pub mod jump;
 pub mod sb;
