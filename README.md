@@ -11,14 +11,25 @@ cd mini-oc-web
 
 # Copy environment configuration
 cp .env.example .env
+# Edit .env: set OPENCODE_SERVER_PASSWORD + SB_PASSWORD + SB_BASE_URL
 
-# Edit .env and fill in your credentials
+# Build SPA (one-time, OR rely on Docker multi-stage build)
+cd web && npm install && npm run build && cd ..
 
 # Run the server
 cargo run
 
 # Open in browser
 open http://127.0.0.1:8100
+```
+
+**Without SilverBullet (local-only dev):** set `SB_BASE_URL=http://127.0.0.1:65535` (unreachable). The BFF will start (warning logged) and return `503 service_unavailable` for `/api/devices` and `/api/config` while `/healthz` and `/` (SPA) keep working.
+
+**Test the BFF in isolation:**
+
+```bash
+# Unit + integration tests (47 passing)
+cargo test
 ```
 
 ## Docker
@@ -73,6 +84,34 @@ See [`docs/superpowers/specs/2026-08-28-mini-oc-web-impl-design.md`](docs/superp
 - **mini-oc-gui end-side changes** — device registration, settings UI, `/health` JSON format (design doc §8) is a separate PR
 - **Full SPA UI** — current SPA is placeholder; full Vue 3 UI in follow-up PR
 - **Phase 2 / Phase 3** — iframe deep-link preheat, nginx `auth_request` SSO
+
+## Local Debug Findings (Phase 1 MVP)
+
+Bugs found and fixed during local smoke-test (see commit `b65cb4b`):
+
+| Issue | Root cause | Fix |
+|---|---|---|
+| BFF wouldn't start without SB | `sb.login().await?` propagated startup error | Wrap SB login with `tracing::warn!` + continue (spec §14 stale-cache) |
+| `/api/devices` returned `500 internal` when SB unreachable | Network errors mapped to generic `Internal` | Add `ServiceUnavailable` (503) variant; map reqwest connect/timeout errors |
+| `/api/devices/{pctype}/{pcname}/projects` returned 500 when device offline | Same as above | Map to `DeviceOffline` (502) per spec §14 |
+| `static_handler` always returned 112-byte placeholder; JS files served as `text/html` | Handler was a stub | Replace with `tower-http::services::ServeDir` + SPA fallback to `index.html` |
+| Dockerfile couldn't build SPA (no node stage) | Single-stage rust + COPY of pre-built dist/ | Add `node:20-alpine` spa-builder stage; COPY from `spa-builder` stage |
+
+## API Reference
+
+See [`docs/superpowers/specs/2026-08-28-mini-oc-web-impl-design.md`](docs/superpowers/specs/2026-08-28-mini-oc-web-impl-design.md) §11 for the full BFF API matrix (11 endpoints).
+
+| Error code | HTTP | Meaning |
+|---|---|---|
+| `unauthorized` | 401 | Missing/invalid cookie |
+| `invalid_pcname` | 400 | `pcname` failed whitelist (`[A-Za-z0-9_-]{1,64}`) |
+| `invalid_target` | 400 | `pctype` not in `{macos,windows}` or jump target unverified |
+| `not_found` | 404 | Device / session / path not found |
+| `rate_limited` | 429 | 5+ login failures within 10 min from same IP |
+| `device_auth_failed` | 502 | Device returned 401/403 (unified credentials mismatch) |
+| `device_offline` | 502 | Device unreachable (connect/timeout) |
+| `service_unavailable` | 503 | SilverBullet unreachable |
+| `internal` | 500 | Other server errors (parse failures, etc.) |
 
 ## Documentation
 
