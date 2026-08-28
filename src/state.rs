@@ -46,7 +46,9 @@ impl AppState {
         let cookie_key = load_or_create_key(&cookie_key_path)?;
 
         let sb = Arc::new(SbClient::new(sb_base_url.clone(), sb_user.clone(), sb_password)?);
-        sb.login().await?;
+        if let Err(e) = sb.login().await {
+            tracing::warn!(error = %e, "SB login failed at startup; continuing without SB session (spec §14 stale-cache fallback)");
+        }
         let devices = Arc::new(DevicesCache::new(sb.clone(), sb_user.clone(), Duration::from_secs(30)));
         let rate_limiter = Arc::new(RateLimiter::new(5, Duration::from_secs(600)));
 
