@@ -1,0 +1,38 @@
+version: "3.9"
+
+services:
+  mini-oc-web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mini-oc-web:dev
+    container_name: mini-oc-web
+    restart: unless-stopped
+    environment:
+      - WEB_PORT=8100
+      - WEB_BIND=0.0.0.0
+      - OPENCODE_SERVER_USERNAME=${OPENCODE_SERVER_USERNAME:-opencode}
+      - OPENCODE_SERVER_PASSWORD=${OPENCODE_SERVER_PASSWORD:-changeme}
+      - SB_BASE_URL=http://silverbullet:3000
+      - SB_USER=${SB_USER:-admin}
+      - SB_PASSWORD=${SB_PASSWORD:-changeme}
+      - COOKIE_KEY_PATH=/data/cookie_key
+      - WEB_STATIC_DIR=/app/web
+    volumes:
+      - mini-oc-web-data:/data
+    networks:
+      - app-net
+    ports:
+      - "8100:8100"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8100/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+
+networks:
+  app-net:
+    driver: bridge
+
+volumes:
+  mini-oc-web-data:
