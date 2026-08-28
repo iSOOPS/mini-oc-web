@@ -1,0 +1,8 @@
+/target
+/web/dist/*
+/web/dist/.gitkeep
+/data
+.env
+.env.local
+*.log
+.DS_Store
