@@ -1,6 +1,6 @@
 /target
 /web/dist/*
-/web/dist/.gitkeep
+!/web/dist/.gitkeep
 /data
 .env
 .env.local
