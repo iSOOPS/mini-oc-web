@@ -1,5 +1,4 @@
 pub mod auth;
-pub mod config_md;
 pub mod devices;
 pub mod error;
 pub mod jump;
@@ -7,3 +6,4 @@ pub mod proxy;
 pub mod routes;
 pub mod sb;
 pub mod state;
+pub mod users;

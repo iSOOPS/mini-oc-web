@@ -15,6 +15,8 @@ pub enum AppError {
     DeviceOffline(String),
     #[error("not found: {0}")]
     NotFound(String),
+    #[error("forbidden: {0}")]
+    Forbidden(String),
     #[error("rate limited")]
     RateLimited,
     #[error("internal: {0}")]
@@ -29,6 +31,7 @@ pub enum ErrorCode {
     DeviceAuthFailed,
     DeviceOffline,
     NotFound,
+    Forbidden,
     RateLimited,
     Internal,
 }
@@ -42,6 +45,7 @@ impl ErrorCode {
             ErrorCode::DeviceAuthFailed => "device_auth_failed",
             ErrorCode::DeviceOffline => "device_offline",
             ErrorCode::NotFound => "not_found",
+            ErrorCode::Forbidden => "forbidden",
             ErrorCode::RateLimited => "rate_limited",
             ErrorCode::Internal => "internal",
         }
@@ -57,6 +61,7 @@ impl AppError {
             AppError::DeviceAuthFailed(_) => ErrorCode::DeviceAuthFailed,
             AppError::DeviceOffline(_) => ErrorCode::DeviceOffline,
             AppError::NotFound(_) => ErrorCode::NotFound,
+            AppError::Forbidden(_) => ErrorCode::Forbidden,
             AppError::RateLimited => ErrorCode::RateLimited,
             AppError::Internal(_) => ErrorCode::Internal,
         }
@@ -68,6 +73,7 @@ impl AppError {
             AppError::InvalidPcname(_) | AppError::InvalidTarget(_) => 400,
             AppError::DeviceAuthFailed(_) | AppError::DeviceOffline(_) => 502,
             AppError::NotFound(_) => 404,
+            AppError::Forbidden(_) => 403,
             AppError::RateLimited => 429,
             AppError::Internal(_) => 500,
         }

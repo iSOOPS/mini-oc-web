@@ -1,5 +1,7 @@
 use base64::Engine;
-use mini_oc_web::jump::{build_jump_url, resolve_base_url, validate_base_url, JumpInput};
+use mini_oc_web::jump::{
+    append_auth_token, build_jump_url, resolve_base_url, validate_base_url, JumpInput,
+};
 
 #[test]
 fn jump_url_ascii_path() {
@@ -13,6 +15,46 @@ fn jump_url_ascii_path() {
         "https://oc-mac.isoops.com/L1VzZXJzL3NhbXVlbC9wcm9qZWN0cy9mb28/session/ses_abc123"
     );
 }
+
+#[test]
+fn auth_token_appended_with_question_mark() {
+    let url = append_auth_token("http://127.0.0.1:9464/Lw/session/ses_1", "opencode", "changeme");
+    let expected = base64::engine::general_purpose::STANDARD.encode("opencode:changeme");
+    assert_eq!(
+        url,
+        format!(
+            "http://127.0.0.1:9464/Lw/session/ses_1?auth_token={}",
+            urlencoding::encode(&expected)
+        )
+    );
+}
+
+#[test]
+fn auth_token_appended_with_ampersand_when_query_exists() {
+    let url = append_auth_token("http://h/p?x=1", "u", "p");
+    assert!(url.starts_with("http://h/p?x=1&auth_token="), "got {}", url);
+}
+
+#[test]
+fn auth_token_percent_encodes_base64_specials() {
+    // "+/==" produced by standard base64 must be percent-encoded so
+    // form-decoding on the device does not corrupt the token.
+    let url = append_auth_token("http://h/", "user", "pass");
+    let token_part = url.split("auth_token=").nth(1).unwrap();
+    assert!(!token_part.contains('+') && !token_part.contains('/') && !token_part.contains('='), "got {}", token_part);
+    // round-trips through percent-decoding back to standard base64
+    let decoded = urlencoding::decode(token_part).unwrap().to_string();
+    assert_eq!(
+        decoded,
+        base64::engine::general_purpose::STANDARD.encode("user:pass")
+    );
+}
+
+#[test]
+fn auth_token_skipped_for_empty_credentials() {
+    assert_eq!(append_auth_token("http://h/p", "", ""), "http://h/p");
+}
+
 
 #[test]
 fn jump_url_chinese_path_percent_encoded() {

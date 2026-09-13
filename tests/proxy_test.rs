@@ -1,5 +1,5 @@
-use mini_oc_web::proxy::{DeviceClient, ProjectInfo, SessionInfo};
-use wiremock::matchers::{method, path, query_param};
+use mini_oc_web::proxy::DeviceClient;
+use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn basic_auth_header() -> &'static str {
@@ -47,6 +47,25 @@ async fn projects_parses_response() {
     assert_eq!(projects[0].path, "/Users/samuel/projects/foo");
 }
 
+/// Real `oc serve` wire format: worktree + ms timestamps (field probe
+/// against 127.0.0.1:9464, see RawProject docs).
+#[tokio::test]
+async fn projects_parses_oc_serve_wire_format() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/project"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"[{"id":"global","worktree":"/","time":{"created":1784163362673,"updated":1789219158527},"sandboxes":[]}]"#,
+        ))
+        .mount(&server)
+        .await;
+    let client = DeviceClient::new(server.uri(), "opencode", "changeme");
+    let projects = client.projects().await.unwrap();
+    assert_eq!(projects.len(), 1);
+    assert_eq!(projects[0].path, "/");
+    assert!(projects[0].last_opened_at.as_deref().is_some_and(|s| s.starts_with("2026-")));
+}
+
 #[tokio::test]
 async fn projects_returns_502_on_401() {
     let server = MockServer::start().await;
@@ -61,22 +80,39 @@ async fn projects_returns_502_on_401() {
 }
 
 #[tokio::test]
-async fn sessions_parses_response() {
+async fn create_session_sends_location_and_parses_wrapped_response() {
     let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/session"))
-        .and(query_param("directory", "/Users/samuel/projects/foo"))
+    Mock::given(method("POST"))
+        .and(path("/api/session"))
+        .and(wiremock::matchers::body_partial_json(serde_json::json!({
+            "location": { "directory": "/Users/samuel/projects/foo" }
+        })))
         .respond_with(ResponseTemplate::new(200).set_body_string(
-            r#"[{"id":"ses_abc","title":"My Session","updatedAt":"2026-08-28T10:00:00+08:00"}]"#,
+            r#"{"data":{"id":"ses_new","title":"New session","location":{"directory":"/Users/samuel/projects/foo"},"time":{"created":1789229091321,"updated":1789229091321}}}"#,
         ))
         .mount(&server)
         .await;
     let client = DeviceClient::new(server.uri(), "opencode", "changeme");
-    let sessions = client
-        .sessions("/Users/samuel/projects/foo")
+    let created = client
+        .create_session("/Users/samuel/projects/foo", None)
         .await
         .unwrap();
-    assert_eq!(sessions.len(), 1);
-    assert_eq!(sessions[0].id, "ses_abc");
-    assert_eq!(sessions[0].title, Some("My Session".to_string()));
+    assert_eq!(created.id, "ses_new");
+    assert_eq!(created.directory.as_deref(), Some("/Users/samuel/projects/foo"));
+}
+
+#[tokio::test]
+async fn create_session_parses_bare_response() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/session"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"id":"ses_new","title":"t","directory":"/"}"#,
+        ))
+        .mount(&server)
+        .await;
+    let client = DeviceClient::new(server.uri(), "opencode", "changeme");
+    let created = client.create_session("/", Some("t")).await.unwrap();
+    assert_eq!(created.id, "ses_new");
+    assert_eq!(created.directory.as_deref(), Some("/"));
 }

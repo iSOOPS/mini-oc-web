@@ -16,6 +16,7 @@ fn error_codes_match_design_doc() {
     assert_eq!(ErrorCode::DeviceAuthFailed.as_str(), "device_auth_failed");
     assert_eq!(ErrorCode::DeviceOffline.as_str(), "device_offline");
     assert_eq!(ErrorCode::NotFound.as_str(), "not_found");
+    assert_eq!(ErrorCode::Forbidden.as_str(), "forbidden");
     assert_eq!(ErrorCode::RateLimited.as_str(), "rate_limited");
     assert_eq!(ErrorCode::Internal.as_str(), "internal");
 }
@@ -28,6 +29,7 @@ fn error_status_codes_match_spec() {
     assert_eq!(AppError::DeviceAuthFailed("x".into()).status(), 502);
     assert_eq!(AppError::DeviceOffline("x".into()).status(), 502);
     assert_eq!(AppError::NotFound("x".into()).status(), 404);
+    assert_eq!(AppError::Forbidden("x".into()).status(), 403);
     assert_eq!(AppError::RateLimited.status(), 429);
     assert_eq!(AppError::Internal("x".into()).status(), 500);
 }
