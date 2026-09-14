@@ -1,7 +1,7 @@
 # DevicesPage 全量刷新 + 全屏菊花遮罩
 
 **Date:** 2026-09-14
-**Status:** Draft (待用户复核)
+**Status:** Approved (with amendment) — ADR 19 added after Task 4 code review
 **Scope:** 仅前端 SPA；后端 BFF 不动
 **Out of Scope:** 后端批量接口、SSE 进度推送、ProjectPage / SessionsPage 的同类改造
 
@@ -84,9 +84,10 @@ onMounted(async () => {
 [b] 创建 AbortController；refreshing = { done: 0, total: N }
         ↓ 显示菊花（visible=true, cancelable=true）
 [c] await auth.probe(signal)
-        ├─ 401 → router 守卫 push('/login')（**不主动 abort**，组件随导航卸载）→ 菊花随组件 unmount 自动消失
-        ├─ 其他错误 → 关闭菊花 + toast「刷新设备清单失败，请稍后重试」→ 保留旧 auth.me → 结束
-        └─ 200 → auth.me 整体替换（devices[].bound/device-name/pctype 全部更新）
+        ├─ 返回 false 且 me===null → 401：refreshAll 显式 router.push('/login'); 菊花关闭; 结束
+        ├─ 返回 false 且 me!==null → 网络/5xx：刷新失败 toast; 保留旧 me; 菊花关闭; 结束
+        ├─ AbortError → 阶段 (a) 被取消; finally 关闭菊花 + toast「已取消刷新」; 结束
+        └─ 返回 true → auth.me 整体替换（devices[].bound/device-name/pctype 全部更新）
         ↓
 [d] 切批（每批 ≤ 6），并发触发 GET /api/device-status/:port
         每台返回后：refreshing.done++，写 statuses[port]（不提前关菊花）
@@ -107,7 +108,7 @@ onMounted(async () => {
 
 | 失败类型                          | 处理                                                                 |
 | --------------------------------- | -------------------------------------------------------------------- |
-| `/api/me` 返回 401                 | 路由守卫跳 /login（现有机制）                                          |
+| `/api/me` 返回 401                 | refreshAll 检测 me===null 后显式 router.push('/login')（ADR 19）        |
 | `/api/me` 其他错误（5xx/网络）      | 关闭菊花 + toast「刷新设备清单失败，请稍后重试」；保留旧 `auth.me`         |
 | 单设备 `/api/device-status` 失败    | 该 port 写 `{online:false, reason: msg}`，**不影响其他设备**，不报错 toast |
 | 用户主动取消                       | 不写 statuses，不报错                                                |
@@ -172,16 +173,23 @@ onMounted(async () => {
 
     try {
       // (a) 重拉 /api/me
-      try {
-        await auth.probe(ctrl.signal)
-      } catch (e) {
-        if (e instanceof UnauthorizedError) return // 守卫会跳 /login
+      // probe() 不抛 UnauthorizedError/network 错误——只抛 AbortError 并返回 false。
+      // 401 与网络错误的区分靠 me 是否被清空（probe 内部约定）。
+      const ok = await auth.probe(ctrl.signal).catch(() => false)
+      if (ctrl.signal.aborted) return             // 阶段 (a) 被取消
+      if (!ok) {
+        if (auth.me === null) {                   // 401：probe 已清空 me
+          refreshing.value = null
+          refreshAbort = null
+          router.push('/login')                   // 路由守卫会接管后续；这里显式触发
+          return
+        }
+        // 网络/5xx：probe 保留旧 me（按 store.ts 的「不轻易登出」约定）
         refreshing.value = null
         refreshAbort = null
         showToast('刷新设备清单失败，请稍后重试', 'warn')
         return
       }
-      if (ctrl.signal.aborted) return             // 阶段 (a) 被取消
 
       // (b) 并发刷 device-status（批 ≤ 6）
       const devices = auth.me?.devices ?? []
@@ -199,7 +207,7 @@ onMounted(async () => {
                 statuses.value = { ...statuses.value, [d.port]: r }
               })
               .catch(e => {
-                if (e instanceof UnauthorizedError) throw e
+                // 批次中若出现 401，由页面级路由守卫在下次导航时兜底跳 /login。
                 if (ctrl.signal.aborted) return
                 statuses.value = {
                   ...statuses.value,
@@ -349,7 +357,8 @@ npm run type-check  # 期望：无 error（如项目有该 script）
 | 15  | LoadingOverlay 用 Teleport to="body"                                      | 避免父组件 z-index / overflow / transform 影响遮罩层级                                       |
 | 16  | 取消按钮仅在 cancelable=true 时渲染                                         | 同一组件服务「不可取消的加载」与「可取消的全量刷新」两种场景                                    |
 | 17  | onMounted **不弹菊花**，仅 fire-and-forget 触发 `device-status` 探测（复用 store 缓存的 `auth.me`）；菊花只服务于用户主动点「刷新状态」 | 首次进入页面就弹菊花体验差；用户主动刷新才需要菊花是更符合用户预期的边界                       |
-| 18  | 取消时菊花关闭后弹一行 toast「已取消刷新」                                  | 取消是用户主动行为，需要显式反馈；菊花关闭动画太短不够醒目                                     |
+| 18  | 取消时菊花关闭后弹一行 toast「已取消刷新」                                  | 取消是用户主动行为，需要显式反馈；菊花关闭动画太短不够醒目 |
+| 19  | `refreshAll` 阶段 (a) 用 `auth.probe()` 的 boolean 返回值 + `me===null` 判别 401 / 网络错误；不再依赖 catch UnauthorizedError（probe 内部已吞，catch 永远到不了） | Task 3 设计 probe 吞掉 401/network 只在 AbortError 时抛，导致 §4.2 原参考实现的 catch 是死代码；修复后才能兑现 spec §3 与 §6.1-7 的承诺 |
 
 ---
 
