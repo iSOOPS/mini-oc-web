@@ -2,15 +2,18 @@
   <div>
     <div class="page-head">
       <h1>选择设备</h1>
-      <button class="ghost refresh-btn" :disabled="probingAny" @click="probeAll">
-        {{ probingAny ? '探测中…' : '刷新状态' }}
+      <button
+        class="ghost refresh-btn"
+        :disabled="refreshing !== null"
+        @click="refreshAll"
+      >
+        {{ refreshing !== null ? '刷新中…' : '刷新状态' }}
       </button>
     </div>
 
     <p v-if="error" class="error">{{ error }}</p>
-    <p v-if="loading" class="muted">加载中…</p>
 
-    <div v-else-if="devices.length === 0" class="card empty">
+    <div v-if="devices.length === 0" class="card empty">
       <p>还没有可用的设备。</p>
       <p class="muted">
         设备清单由管理员在管理后台授权分配;如需添加设备，请联系管理员。
@@ -47,7 +50,6 @@
               </span>
               <template v-if="hostOf(d)"> · {{ hostOf(d) }}</template>
             </div>
-            <div v-else-if="isProbing(d)">探测中…</div>
             <div v-else>状态未知</div>
           </div>
           <!-- 行4 云隧道地址 -->
@@ -55,6 +57,14 @@
         </a>
       </div>
     </div>
+
+    <LoadingOverlay
+      :visible="refreshing !== null"
+      :progress="refreshing ?? undefined"
+      title="正在刷新设备状态…"
+      cancelable
+      @cancel="cancelRefresh"
+    />
 
     <!-- 点击拦截 Toast：单例浮层，最新消息覆盖旧消息；点击关闭，3.5s 自动消失 -->
     <Transition name="toast">
@@ -71,12 +81,99 @@ import { useRouter } from 'vue-router'
 import { apiGet, UnauthorizedError } from '../api'
 import type { DeviceStatus, UserDevice } from '../api'
 import { useAuthStore } from '../store'
+import LoadingOverlay from '../components/LoadingOverlay.vue'
 
 const auth = useAuthStore()
 const router = useRouter()
 
-const loading = ref(true)
 const error = ref('')
+
+// 全量刷新状态：null = 空闲；非 null = 正在刷新（含菊花进度）
+const refreshing = ref<{ done: number; total: number } | null>(null)
+let refreshAbort: AbortController | null = null
+
+async function refreshAll() {
+  if (refreshing.value !== null) return         // 防重入
+  const ctrl = new AbortController()
+  refreshAbort = ctrl
+  const initialDevices = auth.me?.devices ?? []
+  refreshing.value = { done: 0, total: initialDevices.length }
+
+  try {
+    // (a) 重拉 /api/me
+    try {
+      await auth.probe(ctrl.signal)
+    } catch (e) {
+      if (e instanceof UnauthorizedError) return // 守卫会跳 /login
+      refreshing.value = null
+      refreshAbort = null
+      showToast('刷新设备清单失败，请稍后重试', 'warn')
+      return
+    }
+    if (ctrl.signal.aborted) return             // 阶段 (a) 被取消
+
+    // (b) 并发刷 device-status（批 ≤ 6）
+    const devices = auth.me?.devices ?? []
+    const BATCH = 6
+    for (let i = 0; i < devices.length; i += BATCH) {
+      if (ctrl.signal.aborted) break
+      const batch = devices.slice(i, i + BATCH)
+      await Promise.allSettled(
+        batch.map((d) =>
+          apiGet<DeviceStatus>(`/api/device-status/${d.port}`, { signal: ctrl.signal })
+            .then((r) => {
+              // Race guard: fetch 可能在 abort 后才 resolve（极少数情况），
+              // 此时已不算「本次刷新」的结果，不写入 statuses。
+              if (ctrl.signal.aborted) return
+              statuses.value = { ...statuses.value, [d.port]: r }
+            })
+            .catch((e) => {
+              if (e instanceof UnauthorizedError) throw e
+              if (ctrl.signal.aborted) return
+              statuses.value = {
+                ...statuses.value,
+                [d.port]: { online: false, reason: e instanceof Error ? e.message : String(e) },
+              }
+            })
+            .finally(() => {
+              if (refreshing.value) {
+                refreshing.value = { ...refreshing.value, done: refreshing.value.done + 1 }
+              }
+            }),
+        ),
+      )
+    }
+  } finally {
+    const wasCancelled = ctrl.signal.aborted
+    refreshing.value = null
+    refreshAbort = null
+    if (wasCancelled) showToast('已取消刷新', 'muted')
+  }
+}
+
+function cancelRefresh() {
+  refreshAbort?.abort()
+}
+
+async function silentFirstLoad() {
+  // 1) 拿到最新设备清单（无 signal、不弹菊花）。401 由路由守卫处理。
+  await auth.probe().catch(() => {})
+  const devices = auth.me?.devices ?? []
+  // 2) fire-and-forget 触发每台设备状态探测。不 await、不写 refreshing。
+  for (const d of devices) {
+    apiGet<DeviceStatus>(`/api/device-status/${d.port}`)
+      .then((r) => {
+        statuses.value = { ...statuses.value, [d.port]: r }
+      })
+      .catch((e) => {
+        if (e instanceof UnauthorizedError) return
+        statuses.value = {
+          ...statuses.value,
+          [d.port]: { online: false, reason: e instanceof Error ? e.message : String(e) },
+        }
+      })
+  }
+}
 
 // 用户设备清单（管理员授权）直接驱动卡片;状态通过云隧道主动探测。
 const devices = computed(() => auth.me?.devices ?? [])
@@ -87,18 +184,14 @@ function displayName(d: UserDevice): string {
   return d['device-name'] || d.desc || d.name
 }
 
-// port → 探测结果 / 是否探测中
+// port → 探测结果
 const statuses = ref<Record<number, DeviceStatus>>({})
-const probing = ref<Record<number, boolean>>({})
 
 function statusOf(d: UserDevice): DeviceStatus | undefined {
   return statuses.value[d.port]
 }
 function isOnline(d: UserDevice): boolean {
   return statusOf(d)?.online === true
-}
-function isProbing(d: UserDevice): boolean {
-  return probing.value[d.port] === true
 }
 function ocServe(d: UserDevice): string {
   return statusOf(d)?.status?.opencode_serve ?? 'unknown'
@@ -122,30 +215,6 @@ function dotClass(d: UserDevice): string {
   if (!st.online || rathole(d) !== 'running') return 'danger'
   if (!d.bound || ocServe(d) !== 'running') return 'warn'
   return 'online'
-}
-
-const probingAny = computed(() => Object.values(probing.value).some(Boolean))
-
-async function probe(d: UserDevice) {
-  probing.value = { ...probing.value, [d.port]: true }
-  try {
-    statuses.value = {
-      ...statuses.value,
-      [d.port]: await apiGet<DeviceStatus>(`/api/device-status/${d.port}`),
-    }
-  } catch (e) {
-    if (e instanceof UnauthorizedError) return
-    statuses.value = {
-      ...statuses.value,
-      [d.port]: { online: false, reason: e instanceof Error ? e.message : String(e) },
-    }
-  } finally {
-    probing.value = { ...probing.value, [d.port]: false }
-  }
-}
-
-function probeAll() {
-  for (const d of devices.value) probe(d)
 }
 
 // —— 点击拦截 Toast（页面级单例：新消息替换旧消息并重置计时）——
@@ -204,10 +273,8 @@ function onDeviceClick(d: UserDevice) {
   router.push(`/devices/${os}/${encodeURIComponent(d.name)}/projects`)
 }
 
-onMounted(async () => {
-  if (!auth.me) await auth.probe()
-  loading.value = false
-  probeAll()
+onMounted(() => {
+  silentFirstLoad()
 })
 </script>
 
