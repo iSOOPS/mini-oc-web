@@ -101,16 +101,23 @@ async function refreshAll() {
 
   try {
     // (a) 重拉 /api/me
-    try {
-      await auth.probe(ctrl.signal)
-    } catch (e) {
-      if (e instanceof UnauthorizedError) return // 守卫会跳 /login
+    // probe() 不抛 UnauthorizedError/network 错误——只抛 AbortError 并返回 false。
+    // 401 与网络错误的区分靠 me 是否被清空（probe 内部约定）。
+    const ok = await auth.probe(ctrl.signal).catch(() => false)
+    if (ctrl.signal.aborted) return             // 阶段 (a) 被取消
+    if (!ok) {
+      if (auth.me === null) {                   // 401：probe 已清空 me
+        refreshing.value = null
+        refreshAbort = null
+        router.push('/login')                   // 路由守卫会接管后续；这里显式触发
+        return
+      }
+      // 网络/5xx：probe 保留旧 me（按 store.ts 的「不轻易登出」约定）
       refreshing.value = null
       refreshAbort = null
       showToast('刷新设备清单失败，请稍后重试', 'warn')
       return
     }
-    if (ctrl.signal.aborted) return             // 阶段 (a) 被取消
 
     // (b) 并发刷 device-status（批 ≤ 6）
     const devices = auth.me?.devices ?? []
@@ -128,7 +135,7 @@ async function refreshAll() {
               statuses.value = { ...statuses.value, [d.port]: r }
             })
             .catch((e) => {
-              if (e instanceof UnauthorizedError) throw e
+              // 批次中若出现 401，由页面级路由守卫在下次导航时兜底跳 /login。
               if (ctrl.signal.aborted) return
               statuses.value = {
                 ...statuses.value,
