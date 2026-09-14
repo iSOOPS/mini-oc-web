@@ -17,13 +17,19 @@ export const useAuthStore = defineStore('auth', () => {
    * Call from the router beforeEach guard instead, where the result can
    * route to `/login` via `router.push()` (no full page reload).
    */
-  async function probe(): Promise<boolean> {
+  async function probe(signal?: AbortSignal): Promise<boolean> {
     try {
-      me.value = await apiGet<MeResponse>('/api/me')
+      me.value = await apiGet<MeResponse>('/api/me', { signal })
       return true
     } catch (e) {
       if (e instanceof UnauthorizedError) {
         me.value = null
+      }
+      // Aborted by caller — propagate so router guard doesn't spuriously
+      // redirect to /login on cancellation. The router guard never passes
+      // a signal, so this only fires from refreshAll() etc.
+      if (e instanceof DOMException && e.name === 'AbortError') {
+        throw e
       }
       // Network / 5xx: keep previous me (don't flip to logged-out on
       // transient errors), but signal not-logged-in for routing.
