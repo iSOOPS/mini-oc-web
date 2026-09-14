@@ -84,7 +84,7 @@ onMounted(async () => {
 [b] 创建 AbortController；refreshing = { done: 0, total: N }
         ↓ 显示菊花（visible=true, cancelable=true）
 [c] await auth.probe(signal)
-        ├─ 401 → router 守卫跳 /login（AbortController abort）→ 关闭菊花 → 结束
+        ├─ 401 → router 守卫 push('/login')（**不主动 abort**，组件随导航卸载）→ 菊花随组件 unmount 自动消失
         ├─ 其他错误 → 关闭菊花 + toast「刷新设备清单失败，请稍后重试」→ 保留旧 auth.me → 结束
         └─ 200 → auth.me 整体替换（devices[].bound/device-name/pctype 全部更新）
         ↓
@@ -158,7 +158,7 @@ onMounted(async () => {
 ### 4.2 DevicesPage 改造
 
 - 删除 `probing` ref、`probingAny` computed、`probe()` 函数
-- 新增：
+- 新增 `refreshAll`（用户点按钮时调用，带菊花）：
   ```ts
   const refreshing = ref<{ done: number; total: number } | null>(null)
   let refreshAbort: AbortController | null = null
@@ -192,7 +192,12 @@ onMounted(async () => {
         await Promise.allSettled(
           batch.map(d =>
             apiGet<DeviceStatus>(`/api/device-status/${d.port}`, { signal: ctrl.signal })
-              .then(r => { statuses.value = { ...statuses.value, [d.port]: r } })
+              .then(r => {
+                // Race guard: fetch 可能在 abort 后才 resolve（极少数情况），
+                // 此时已不算「本次刷新」的结果，不写入 statuses。
+                if (ctrl.signal.aborted) return
+                statuses.value = { ...statuses.value, [d.port]: r }
+              })
               .catch(e => {
                 if (e instanceof UnauthorizedError) throw e
                 if (ctrl.signal.aborted) return
@@ -219,9 +224,30 @@ onMounted(async () => {
 
   function cancelRefresh() { refreshAbort?.abort() }
   ```
+- 新增 `silentFirstLoad`（onMounted 调用，**不带菊花**）：
+  ```ts
+  async function silentFirstLoad() {
+    // 1) 拿到最新设备清单（无 signal、不弹菊花）。401 由路由守卫处理。
+    await auth.probe().catch(() => {})
+    const devices = auth.me?.devices ?? []
+    // 2) fire-and-forget 触发每台设备状态探测。不 await、不写 refreshing。
+    //    单设备失败被原 probe() 内部 catch 吞（写离线），无需额外错误处理。
+    for (const d of devices) {
+      apiGet<DeviceStatus>(`/api/device-status/${d.port}`)
+        .then(r => { statuses.value = { ...statuses.value, [d.port]: r } })
+        .catch(e => {
+          if (e instanceof UnauthorizedError) return
+          statuses.value = {
+            ...statuses.value,
+            [d.port]: { online: false, reason: e instanceof Error ? e.message : String(e) },
+          }
+        })
+    }
+  }
+  ```
 - 按钮：`@click="refreshAll"` `:disabled="refreshing !== null"`，文案随 `refreshing` 切换「刷新状态」/「刷新中…」
 - 模板底部加 `<LoadingOverlay :visible="refreshing !== null" :progress="refreshing ?? undefined" title="正在刷新设备状态…" cancelable @cancel="cancelRefresh" />`
-- `onMounted` 内 `probeAll()` 调用替换为 `refreshAll()`，**首次进入也走完整流程**（保证设备清单是最新的，而不是只走 `/api/me` + cache）
+- `onMounted` 内 `probeAll()` 调用替换为 `silentFirstLoad()`：**不弹菊花**——首次进入页面的菊花体验差；菊花只服务于用户主动点「刷新状态」的场景。
 
 ### 4.3 store.ts 微调
 
@@ -276,7 +302,7 @@ async function handle<T>(r: Response): Promise<T> {
 | 文件                                       | 类型   | 改动                                                                                              |
 | ------------------------------------------ | ------ | ------------------------------------------------------------------------------------------------- |
 | `web/src/components/LoadingOverlay.vue`     | 新建   | 全局通用菊花遮罩                                                                                   |
-| `web/src/pages/DevicesPage.vue`             | 修改   | 删除 probing 旧逻辑；新增 refreshAll / cancelRefresh；引入 LoadingOverlay；onMounted 改调 refreshAll |
+| `web/src/pages/DevicesPage.vue`             | 修改   | 删除 probing 旧逻辑；新增 refreshAll / cancelRefresh / silentFirstLoad；引入 LoadingOverlay；onMounted 改调 silentFirstLoad |
 | `web/src/api.ts`                            | 修改   | 仅 apiGet 第二参数 `RequestInit`（用于 signal 透传）                                              |
 | `web/src/store.ts`                          | 修改   | `auth.probe(signal?)`                                                                              |
 | `web/src/style.css`                         | 不改   | LoadingOverlay scoped 样式足够                                                                     |
@@ -322,7 +348,7 @@ npm run type-check  # 期望：无 error（如项目有该 script）
 | 14  | 不加后端批量接口，前端用 Promise.allSettled + 批 ≤ 6 并发                   | 用户明确选择「保持前端并发，不动后端」；6 是 Chrome 同源连接上限；N 通常远小于此阈值          |
 | 15  | LoadingOverlay 用 Teleport to="body"                                      | 避免父组件 z-index / overflow / transform 影响遮罩层级                                       |
 | 16  | 取消按钮仅在 cancelable=true 时渲染                                         | 同一组件服务「不可取消的加载」与「可取消的全量刷新」两种场景                                    |
-| 17  | onMounted 也走 refreshAll 而非「先 /api/me + 仅 fire probeAll」              | 保证首次进入页面的设备清单也是最新（与点击刷新语义一致），避免出现「首次进入看到旧 bound」       |
+| 17  | onMounted **不弹菊花**，仅 fire-and-forget 触发 `device-status` 探测（复用 store 缓存的 `auth.me`）；菊花只服务于用户主动点「刷新状态」 | 首次进入页面就弹菊花体验差；用户主动刷新才需要菊花是更符合用户预期的边界                       |
 | 18  | 取消时菊花关闭后弹一行 toast「已取消刷新」                                  | 取消是用户主动行为，需要显式反馈；菊花关闭动画太短不够醒目                                     |
 
 ---
