@@ -43,8 +43,8 @@ async function handle<T>(r: Response): Promise<T> {
   return r.json()
 }
 
-export const apiGet = <T>(path: string): Promise<T> =>
-  fetch(path, { credentials: 'include' }).then((r) => handle<T>(r))
+export const apiGet = <T>(path: string, init?: RequestInit): Promise<T> =>
+  fetch(path, { credentials: 'include', ...init }).then((r) => handle<T>(r))
 
 export const apiPost = <T>(path: string, body: unknown): Promise<T> =>
   fetch(path, {
