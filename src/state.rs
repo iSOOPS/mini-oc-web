@@ -1,20 +1,64 @@
 use crate::auth::RateLimiter;
-use crate::config_md::PortalConfig;
 use crate::devices::DevicesCache;
 use crate::sb::SbClient;
-use std::sync::Arc;
-use std::time::Duration;
+use crate::users::UsersCache;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// Per-device Basic-Auth credentials supplied by the user through the SPA
+/// "device authorization" dialog (device key `pctype/pcname` → creds).
+///
+/// In-memory only, never persisted: a BFF restart clears it and the user
+/// re-enters credentials on the next device visit. Entries take priority
+/// over the unified `OPENCODE_SERVER_USERNAME/PASSWORD` from the config,
+/// so a device whose credentials differ from the portal's keeps working
+/// after the user authorizes once.
+#[derive(Default)]
+pub struct DeviceCreds {
+    map: Mutex<HashMap<String, (String, String)>>,
+}
+
+impl DeviceCreds {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn get(&self, device_key: &str) -> Option<(String, String)> {
+        self.map.lock().unwrap().get(device_key).cloned()
+    }
+
+    pub fn set(&self, device_key: &str, username: &str, password: &str) {
+        self.map
+            .lock()
+            .unwrap()
+            .insert(device_key.to_string(), (username.to_string(), password.to_string()));
+    }
+}
 
 #[derive(Clone)]
 pub struct AppConfig {
     pub web_port: u16,
     pub web_bind: String,
     pub web_static_dir: String,
-    pub username: String,
-    pub password: String,
+    /// Unified fallback credentials for the BFF→device API hop
+    /// (OPENCODE_SERVER_USERNAME/PASSWORD). NOT used for portal login any
+    /// more — portal users log in with per-user 32-char keys.
+    pub device_user: String,
+    pub device_pass: String,
     pub sb_user: String,
     pub sb_base_url: String,
+    /// The SilverBullet password from env — doubles as the super-admin
+    /// login password for /api/admin/login.
+    pub sb_password: String,
+    /// Rathole (cloud tunnel) key from env — surfaced to the admin page
+    /// as "云服务密钥".
+    pub rathole_key: String,
     pub cookie_key: Vec<u8>,
+    /// The portal host the user reaches us on. Used to build deep-link
+    /// URLs of the form `{portal_base}/{b64pc}/...`. Defaults to
+    /// `https://oc.isoops.com`; override via `PORTAL_BASE`.
+    pub portal_base: String,
 }
 
 #[derive(Clone)]
@@ -22,7 +66,18 @@ pub struct AppState {
     pub config: AppConfig,
     pub sb: Arc<SbClient>,
     pub devices: Arc<DevicesCache>,
+    pub users: Arc<UsersCache>,
     pub rate_limiter: Arc<RateLimiter>,
+    pub device_creds: Arc<DeviceCreds>,
+    /// Process start marker for /api/admin/info uptime.
+    pub started_at: Instant,
+}
+
+/// Read an env var and strip trailing CR/LF (Windows-edited .env files
+/// frequently end every line with CRLF; `dotenvy` keeps them, which makes
+/// passwords and URLs silently mismatch).
+fn env_var_trim(key: &str) -> Result<String, anyhow::Error> {
+    Ok(std::env::var(key)?.trim_end_matches(['\r', '\n']).to_string())
 }
 
 impl AppState {
@@ -31,41 +86,52 @@ impl AppState {
         let web_port: u16 = std::env::var("WEB_PORT")
             .unwrap_or_else(|_| "8100".into())
             .parse()?;
-        let web_bind = std::env::var("WEB_BIND").unwrap_or_else(|_| "0.0.0.0".into());
+        let web_bind = env_var_trim("WEB_BIND").unwrap_or_else(|_| "0.0.0.0".into());
         let web_static_dir =
-            std::env::var("WEB_STATIC_DIR").unwrap_or_else(|_| "./web/dist".into());
-        let username = std::env::var("OPENCODE_SERVER_USERNAME")?;
-        let password = std::env::var("OPENCODE_SERVER_PASSWORD")?;
-        let sb_user = std::env::var("SB_USER").unwrap_or_else(|_| "admin".into());
-        let sb_password = std::env::var("SB_PASSWORD")?;
+            env_var_trim("WEB_STATIC_DIR").unwrap_or_else(|_| "./web/dist".into());
+        let username = env_var_trim("OPENCODE_SERVER_USERNAME")?;
+        let password = env_var_trim("OPENCODE_SERVER_PASSWORD")?;
+        let sb_user = env_var_trim("SB_USER").unwrap_or_else(|_| "admin".into());
+        let sb_password = env_var_trim("SB_PASSWORD")?;
         let sb_base_url =
-            std::env::var("SB_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:3000".into());
+            env_var_trim("SB_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:3000".into());
+        let rathole_key = env_var_trim("RATHOLE_KEY").unwrap_or_default();
 
         let cookie_key_path =
             std::env::var("COOKIE_KEY_PATH").unwrap_or_else(|_| "/data/cookie_key".into());
         let cookie_key = load_or_create_key(&cookie_key_path)?;
 
-        let sb = Arc::new(SbClient::new(sb_base_url.clone(), sb_user.clone(), sb_password)?);
-        if let Err(e) = sb.login().await {
-            tracing::warn!(error = %e, "SB login failed at startup; continuing without SB session (spec §14 stale-cache fallback)");
-        }
+        let sb = Arc::new(SbClient::new(sb_base_url.clone(), sb_user.clone(), sb_password.clone())?);
+        sb.login().await?;
         let devices = Arc::new(DevicesCache::new(sb.clone(), sb_user.clone(), Duration::from_secs(30)));
+        let users = Arc::new(UsersCache::new(sb.clone(), Duration::from_secs(30)));
         let rate_limiter = Arc::new(RateLimiter::new(5, Duration::from_secs(600)));
+
+        let portal_base = std::env::var("PORTAL_BASE")
+            .unwrap_or_else(|_| "https://oc.isoops.com".into())
+            .trim_end_matches('/')
+            .to_string();
 
         Ok(Self {
             config: AppConfig {
                 web_port,
                 web_bind,
                 web_static_dir,
-                username,
-                password,
+                device_user: username,
+                device_pass: password,
                 sb_user,
                 sb_base_url,
+                sb_password,
+                rathole_key,
                 cookie_key,
+                portal_base,
             },
             sb,
             devices,
+            users,
             rate_limiter,
+            device_creds: Arc::new(DeviceCreds::new()),
+            started_at: Instant::now(),
         })
     }
 }
@@ -94,8 +160,4 @@ fn load_or_create_key(path: &str) -> anyhow::Result<Vec<u8>> {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(buf)
-}
-
-pub fn default_config_for(pcname: &str) -> PortalConfig {
-    crate::config_md::default_config(pcname)
 }

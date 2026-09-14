@@ -10,6 +10,53 @@ pub struct ProjectInfo {
     pub last_opened_at: Option<String>,
 }
 
+/// Wire format of `oc serve`'s `GET /project`: entries look like
+/// `{"id":"global","worktree":"/","time":{"created":1784163362673,
+/// "updated":1789219158527},"sandboxes":[]}`. The BFF re-projects this
+/// onto [`ProjectInfo`] (path = worktree, lastOpenedAt = time.updated)
+/// so the SPA keeps a stable shape.
+#[derive(Debug, Deserialize)]
+struct RawProject {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    worktree: Option<String>,
+    /// Legacy/alternate shape kept for compatibility with older mocks.
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    time: Option<RawTime>,
+    #[serde(default, rename = "lastOpenedAt")]
+    last_opened_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawTime {
+    #[serde(default)]
+    updated: Option<i64>,
+}
+
+fn ms_to_rfc3339(ms: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp_millis(ms).map(|d| d.to_rfc3339())
+}
+
+impl From<RawProject> for ProjectInfo {
+    fn from(r: RawProject) -> Self {
+        let path = r
+            .worktree
+            .or(r.path)
+            .or(r.id)
+            .unwrap_or_default();
+        let last_opened_at = r
+            .last_opened_at
+            .or_else(|| r.time.and_then(|t| t.updated).and_then(ms_to_rfc3339));
+        ProjectInfo {
+            path,
+            last_opened_at,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub id: String,
@@ -24,6 +71,43 @@ pub struct CreatedSession {
     pub id: String,
     #[serde(default)]
     pub directory: Option<String>,
+}
+
+/// Wire shapes for `POST /api/session`: real opencode answers
+/// `{"data":{id,title,location:{directory}}}`; bare `{id,...}` is kept
+/// for mock compatibility.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum CreatedWire {
+    Wrapped { data: RawCreatedData },
+    Bare(RawCreatedData),
+}
+
+#[derive(Debug, Deserialize)]
+struct RawCreatedData {
+    id: String,
+    #[serde(default)]
+    location: Option<RawLocation>,
+    #[serde(default)]
+    directory: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawLocation {
+    #[serde(default)]
+    directory: Option<String>,
+}
+
+impl From<RawCreatedData> for CreatedSession {
+    fn from(r: RawCreatedData) -> Self {
+        CreatedSession {
+            id: r.id,
+            directory: r
+                .location
+                .and_then(|l| l.directory)
+                .or(r.directory),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -89,32 +173,32 @@ impl DeviceClient {
 
     pub async fn projects(&self) -> AppResult<Vec<ProjectInfo>> {
         let resp = self.send_basic(reqwest::Method::GET, "/project").await?;
-        resp.json::<Vec<ProjectInfo>>()
+        let raw: Vec<RawProject> = resp
+            .json()
             .await
-            .map_err(|e| AppError::Internal(format!("projects parse: {}", e)))
-    }
-
-    pub async fn sessions(&self, directory: &str) -> AppResult<Vec<SessionInfo>> {
-        let encoded = urlencoding::encode(directory);
-        let resp = self
-            .send_basic(reqwest::Method::GET, &format!("/session?directory={}", encoded))
-            .await?;
-        resp.json::<Vec<SessionInfo>>()
-            .await
-            .map_err(|e| AppError::Internal(format!("sessions parse: {}", e)))
+            .map_err(|e| AppError::Internal(format!("projects parse: {}", e)))?;
+        Ok(raw.into_iter().map(ProjectInfo::from).collect())
     }
 
     pub async fn create_session(&self, directory: &str, title: Option<&str>) -> AppResult<CreatedSession> {
         let url = format!("{}/api/session", self.base_url);
-        let body = serde_json::json!({
-            "directory": directory,
-            "title": title,
-        });
+        // Real opencode contract: directory rides inside `location`; the
+        // old `{directory}` top-level field was silently ignored by the
+        // server (falling back to its own default dir). Omit `title`
+        // entirely when not given so the server generates one.
+        let mut body = serde_json::Map::new();
+        body.insert(
+            "location".to_string(),
+            serde_json::json!({ "directory": directory }),
+        );
+        if let Some(t) = title {
+            body.insert("title".to_string(), serde_json::json!(t));
+        }
         let resp = self
             .http
             .post(&url)
             .basic_auth(&self.username, Some(&self.password))
-            .json(&body)
+            .json(&serde_json::Value::Object(body))
             .send()
             .await
             .map_err(|e| AppError::Internal(format!("create_session: {}", e)))?;
@@ -131,8 +215,13 @@ impl DeviceClient {
                 self.base_url, status
             )));
         }
-        resp.json::<CreatedSession>()
+        let wire: CreatedWire = resp
+            .json()
             .await
-            .map_err(|e| AppError::Internal(format!("create_session parse: {}", e)))
+            .map_err(|e| AppError::Internal(format!("create_session parse: {}", e)))?;
+        Ok(match wire {
+            CreatedWire::Wrapped { data } => CreatedSession::from(data),
+            CreatedWire::Bare(d) => CreatedSession::from(d),
+        })
     }
 }
