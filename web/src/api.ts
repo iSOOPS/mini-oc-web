@@ -107,6 +107,13 @@ export interface UserDevice {
   pctype: string
   /** 绑定状态（默认 false）。 */
   bound?: boolean
+  // 新增（PR 2026-09-14）：/api/me 返运行时状态；其他接口不返，字段为可选
+  /** 是否在线（BFF /api/me 内部探测结果）。 */
+  online?: boolean
+  /** 探测失败原因（online=false 时填）。 */
+  reason?: string
+  /** 设备端 /status 响应体（online=true 时填）。 */
+  status?: DeviceStatusInfo
 }
 
 /** 用户级 SB 连接配置：域名（默认 https://md.isoops.com）/账号/密码。 */
