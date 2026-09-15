@@ -75,7 +75,7 @@ async fn me_reports_cloud_ip_and_last_used_at() {
                 "id": TEST_USER_ID,
                 "name": TEST_USER,
                 "key": TEST_KEY,
-                "cloud_ip": "1.2.3.4",
+                "cloud_ip": "127.0.0.1",
                 "last_used_at": "2026-09-13T08:00:00+08:00",
                 "devices": [{"name": "dev-x", "port": 4040}],
             }]
@@ -89,7 +89,7 @@ async fn me_reports_cloud_ip_and_last_used_at() {
     let resp = send(&app, authed_get("/api/me", &cookie)).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await;
-    assert_eq!(body["cloud_ip"], "1.2.3.4");
+    assert_eq!(body["cloud_ip"], "127.0.0.1");
     assert_eq!(body["last_used_at"], "2026-09-13T08:00:00+08:00");
 }
 
@@ -276,6 +276,7 @@ async fn me_reports_id_and_sb_config() {
                 "id": "123456",
                 "name": TEST_USER,
                 "key": TEST_KEY,
+                "cloud_ip": "127.0.0.1",
                 "devices": [{"name": "dev-x", "port": 4040}],
                 "sb": {
                     "base_url": "https://sb.example.com",

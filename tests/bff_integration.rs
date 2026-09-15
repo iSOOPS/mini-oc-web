@@ -668,3 +668,60 @@ async fn device_detail_requires_session() {
     let resp = send(&app, req(Method::GET, "/api/devices/windows/HomeWin/detail")).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+// ---------------------------------------------------------------------------
+// me returns enriched devices (NEW — PR 2026-09-14 batch API)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn me_returns_enriched_devices_with_runtime_status() {
+    let sb = MockServer::start().await;
+    let online_dev = MockServer::start().await;
+    let offline_dev = MockServer::start().await; // no mocks mounted → probe fails
+
+    Mock::given(method("GET"))
+        .and(path("/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"opencode_serve":"running","rathole":"running","system":{"hostname":"box1"},"version":"0.5"}"#,
+        ))
+        .mount(&online_dev)
+        .await;
+
+    // Registry with cloud_ip=127.0.0.1 and per-device ports matching the
+    // mock servers — the me handler probes http://{cloud_ip}:{port}/status.
+    let app = test_app(
+        build_state_with_cloud_ip(
+            &sb,
+            "127.0.0.1",
+            &[
+                ("dev-online", online_dev.uri().as_str()),
+                ("dev-offline", offline_dev.uri().as_str()),
+            ],
+        )
+        .await,
+    );
+    let cookie = login_mounted(&app).await;
+
+    let resp = send(&app, authed_get("/api/me", &cookie)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let devices = body["devices"].as_array().expect("devices[]");
+    assert_eq!(devices.len(), 2);
+
+    let online = devices
+        .iter()
+        .find(|d| d["name"] == "dev-online")
+        .unwrap();
+    assert_eq!(online["online"], true);
+    assert!(online["status"].is_object());
+    assert_eq!(online["status"]["opencode_serve"], "running");
+    assert_eq!(online["status"]["system"]["hostname"], "box1");
+
+    let offline = devices
+        .iter()
+        .find(|d| d["name"] == "dev-offline")
+        .unwrap();
+    assert_eq!(offline["online"], false);
+    assert!(offline["reason"].is_string());
+}

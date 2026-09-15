@@ -3,15 +3,14 @@
 //!
 //! The file shape mirrors `devices.json`: a versioned wrapper plus a list.
 //! The BFF (via the admin API) is the only writer; end-sides never touch
-//! it. Reads go through a short-TTL cache exactly like `DevicesCache`.
+//! it. Reads hit SB directly on every call (no in-process cache).
 
 use crate::devices::validate_pcname;
 use crate::error::{AppError, AppResult};
 use crate::sb::SbClient;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, OnceLock};
 
 /// SB path of the multi-tenant user registry (JSON body in a .md doc).
 pub const USERS_PATH: &str = "web/opencode/config.md";
@@ -272,8 +271,8 @@ pub fn generate_key() -> String {
 
 /// Generate a fresh 6-digit numeric user id (`100000..=999999`, no leading
 /// zeros). The space is only 9·10^5, so callers MUST dedupe against a
-/// freshly-fetched remote registry ([`UsersCache::load_fresh`]) — a stale
-/// TTL cache could hide a user another writer just appended.
+/// freshly-fetched remote registry ([`UsersStore::load`]) — every load
+/// hits SB, so no stale window can hide a user another writer appended.
 pub fn generate_user_id() -> String {
     use rand::Rng;
     rand::thread_rng().gen_range(100_000..1_000_000).to_string()
@@ -281,8 +280,8 @@ pub fn generate_user_id() -> String {
 
 /// Generate a 6-digit numeric user id guaranteed unique within `uf`.
 /// Callers that mint ids MUST pass a registry fetched with
-/// [`UsersCache::load_fresh`] — the id space is only 9·10^5, so dedupe
-/// has to run against the freshest remote state, not a stale cache.
+/// [`UsersStore::load`] — the id space is only 9·10^5, so dedupe
+/// has to run against the freshest remote state (every load hits SB).
 pub fn generate_user_id_unique(uf: &UsersFile) -> String {
     loop {
         let id = generate_user_id();
@@ -396,70 +395,40 @@ pub fn validate_user_devices(devices: &[UserDevice]) -> AppResult<()> {
     Ok(())
 }
 
-pub struct UsersCache {
+/// Thin store wrapping `SbClient` directly — no in-process TTL. Each call
+/// to `load()` hits SB fresh. Rationale (ADR #20): small user base,
+/// infrequent clicks, SB can absorb the load; the cache's stale window
+/// outweighed its perf benefit.
+pub struct UsersStore {
     sb: Arc<SbClient>,
-    ttl: Duration,
-    state: Mutex<Option<(Instant, UsersFile)>>,
+    /// Path is a fixed constant `web/opencode/config.md` (no `{user}`
+    /// placeholder, unlike `DEVICES_PATH`). Currently unread; the
+    /// constructor accepts `sb_user` to keep parity with `DevicesStore`
+    /// (which DOES need it) and for future per-user paths if/when the
+    /// user registry is split. Tracked for removal in Task 4 cleanup.
+    #[allow(dead_code)]
+    sb_user: String,
 }
 
-impl UsersCache {
-    pub fn new(sb: Arc<SbClient>, ttl: Duration) -> Self {
+impl UsersStore {
+    pub fn new(sb: Arc<SbClient>, sb_user: impl Into<String>) -> Self {
         Self {
             sb,
-            ttl,
-            state: Mutex::new(None),
+            sb_user: sb_user.into(),
         }
     }
 
     /// Load `web/opencode/config.md`. A missing document is an empty
-    /// registry (first boot — the admin creates the first user).
+    /// registry (first boot — the admin creates the first user). Always
+    /// hits SB; no cache.
     pub async fn load(&self) -> AppResult<UsersFile> {
-        let now = Instant::now();
-        {
-            let state = self.state.lock().unwrap();
-            if let Some((ts, uf)) = state.as_ref() {
-                if now.duration_since(*ts) < self.ttl {
-                    return Ok(uf.clone());
-                }
-            }
-        }
-        let uf = self.fetch_and_migrate().await?;
-        *self.state.lock().unwrap() = Some((now, uf.clone()));
-        Ok(uf)
-    }
-
-    /// Always pull `web/opencode/config.md` straight from the remote SB
-    /// instance, bypassing the TTL cache, and refresh the cached entry
-    /// with what came back. Used before minting 6-digit user ids: the id
-    /// space is small and the cache can be up to `ttl` stale while another
-    /// writer (a second BFF instance, a manual SB edit) may have appended
-    /// users in the meantime — uniqueness must be checked against the
-    /// freshest remote state, not the cache.
-    pub async fn load_fresh(&self) -> AppResult<UsersFile> {
-        let now = Instant::now();
-        let uf = self.fetch_and_migrate().await?;
-        *self.state.lock().unwrap() = Some((now, uf.clone()));
-        Ok(uf)
-    }
-
-    /// Fetch and parse the registry document from SB. A missing document
-    /// is an empty registry (first boot).
-    async fn fetch(&self) -> AppResult<UsersFile> {
         let body = match self.sb.get_fs(USERS_PATH).await {
             Ok(b) => b,
             Err(AppError::NotFound(_)) => return Ok(UsersFile::default()),
             Err(e) => return Err(e),
         };
-        serde_json::from_str(&body)
-            .map_err(|e| AppError::Internal(format!("users config parse: {}", e)))
-    }
-
-    /// Fetch, then migrate legacy uuid-format ids down to the 6-digit
-    /// scheme. The rewrite is persisted to SB BEFORE the migrated state
-    /// is served: an id is identity — handing out ids that never reached
-    /// SB would give the same user a different id on every retry.
-    async fn fetch_and_migrate(&self) -> AppResult<UsersFile> {
-        let mut uf = self.fetch().await?;
+        let mut uf: UsersFile = serde_json::from_str(&body)
+            .map_err(|e| AppError::Internal(format!("users config parse: {}", e)))?;
         if migrate_legacy_ids(&mut uf) {
             let body = serialize_users_file(&uf)?;
             self.sb.put_fs(USERS_PATH, &body).await?;
@@ -467,16 +436,9 @@ impl UsersCache {
         Ok(uf)
     }
 
-    pub async fn invalidate(&self) {
-        self.state.lock().unwrap().take();
-    }
-
-    /// Serialize and write the whole registry back to SB, then drop the
-    /// cache so the next read observes the new state.
     pub async fn save(&self, file: &UsersFile) -> AppResult<()> {
         let body = serialize_users_file(file)?;
         self.sb.put_fs(USERS_PATH, &body).await?;
-        self.invalidate().await;
         Ok(())
     }
 }
@@ -813,4 +775,33 @@ mod tests {
         let parsed: Vec<UserDevice> = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, uf.users[0].devices);
     }
+}
+
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn users_store_load_hits_sb_every_call() {
+        let sb = MockServer::start().await;
+        // Expect TWO GET calls (proves no cache short-circuits the second)
+        Mock::given(method("GET"))
+            .and(path("/.fs/web/opencode/config.md"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(USERS_FILE_BODY))
+            .expect(2)
+            .mount(&sb)
+            .await;
+        let store = UsersStore::new(
+            std::sync::Arc::new(crate::sb::SbClient::new(sb.uri(), "admin", "pw").unwrap()),
+            "admin",
+        );
+        // First call
+        let _ = store.load().await.unwrap();
+        // Second call — must hit SB again (no cache)
+        let _ = store.load().await.unwrap();
+    }
+
+    const USERS_FILE_BODY: &str = r#"{"version":1,"users":[]}"#;
 }

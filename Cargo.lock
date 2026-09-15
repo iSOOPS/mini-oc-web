@@ -1034,6 +1034,7 @@ dependencies = [
  "base64",
  "chrono",
  "dotenvy",
+ "futures",
  "hmac",
  "hostname",
  "local-ip-address",

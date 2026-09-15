@@ -18,10 +18,10 @@ use axum::body::Body;
 use axum::http::{header, Method, Request, Response, StatusCode};
 use axum::Router;
 use mini_oc_web::auth::RateLimiter;
-use mini_oc_web::devices::DevicesCache;
+use mini_oc_web::devices::DevicesStore;
 use mini_oc_web::sb::SbClient;
 use mini_oc_web::state::{AppConfig, AppState};
-use mini_oc_web::users::UsersCache;
+use mini_oc_web::users::UsersStore;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tower::ServiceExt;
@@ -78,6 +78,9 @@ pub fn cookie_key() -> Vec<u8> {
 /// (`tester`, key [`TEST_KEY`]) whose device list is `devices` (port 4040
 /// for every entry — tests only care about the names for isolation; the
 /// desc mirrors the service name, pctype defaults to windows).
+/// `cloud_ip` is a loopback literal so `/api/me`'s runtime status probes
+/// fail fast (connection refused) instead of egressing to the real
+/// fleet-default cloud server.
 pub fn users_json(devices: &[&str]) -> String {
     serde_json::json!({
         "version": 1,
@@ -85,9 +88,43 @@ pub fn users_json(devices: &[&str]) -> String {
             "id": TEST_USER_ID,
             "name": TEST_USER,
             "key": TEST_KEY,
+            "cloud_ip": "127.0.0.1",
             "devices": devices
                 .iter()
                 .map(|d| serde_json::json!({"desc": d, "name": d, "port": 4040, "pctype": "windows", "bound": false}))
+                .collect::<Vec<_>>(),
+            "created_at": "2026-09-13T00:00:00+08:00",
+            "updated_at": "2026-09-13T00:00:00+08:00"
+        }]
+    })
+    .to_string()
+}
+
+/// Port component of an HTTP base URL like `http://127.0.0.1:54321`
+/// (wiremock binds a random port per mock server).
+pub fn port_of(uri: &str) -> u16 {
+    uri.rsplit_once(':')
+        .and_then(|(_, p)| p.parse().ok())
+        .unwrap_or(4040)
+}
+
+/// User-registry variant with an explicit `cloud_ip` and per-device
+/// ports parsed from device mock URIs — the coordinates `/api/me`'s
+/// runtime status probes consume (`http://{cloud_ip}:{port}/status`).
+pub fn users_json_with_ports(cloud_ip: &str, name_uris: &[(&str, &str)]) -> String {
+    serde_json::json!({
+        "version": 1,
+        "users": [{
+            "id": TEST_USER_ID,
+            "name": TEST_USER,
+            "key": TEST_KEY,
+            "cloud_ip": cloud_ip,
+            "devices": name_uris
+                .iter()
+                .map(|(name, uri)| serde_json::json!({
+                    "desc": name, "name": name, "port": port_of(uri),
+                    "pctype": "windows", "bound": false
+                }))
                 .collect::<Vec<_>>(),
             "created_at": "2026-09-13T00:00:00+08:00",
             "updated_at": "2026-09-13T00:00:00+08:00"
@@ -104,12 +141,8 @@ pub fn users_json(devices: &[&str]) -> String {
 /// client's auto-relogin).
 pub fn build_state(sb_base_url: &str) -> Arc<AppState> {
     let sb = Arc::new(SbClient::new(sb_base_url, SB_USER, SB_PASS).unwrap());
-    let devices = Arc::new(DevicesCache::new(
-        sb.clone(),
-        SB_USER,
-        Duration::from_secs(30),
-    ));
-    let users = Arc::new(UsersCache::new(sb.clone(), Duration::from_secs(30)));
+    let devices = Arc::new(DevicesStore::new(sb.clone(), SB_USER));
+    let users = Arc::new(UsersStore::new(sb.clone(), SB_USER));
     let rate_limiter = Arc::new(RateLimiter::new(5, Duration::from_secs(600)));
     Arc::new(AppState {
         config: AppConfig {
@@ -138,6 +171,28 @@ pub fn build_state(sb_base_url: &str) -> Arc<AppState> {
 /// `tower::ServiceExt::oneshot` requests — no real port is bound.
 pub fn test_app(state: Arc<AppState>) -> Router {
     mini_oc_web::routes::build_router((*state).clone())
+}
+
+/// [`build_state`] for tests that exercise the `/api/me` runtime status
+/// probes: mounts a registry whose `cloud_ip` and per-device ports point
+/// at the given device mock URIs (`port_mappings`: service name → mock
+/// base URL), then wires the `AppState` to the SB mock. Log in
+/// afterwards with [`login_mounted`] — NOT [`login`]/[`login_as`], whose
+/// registry re-mount would shadow this one (wiremock serves the most
+/// recently mounted mock for a path first).
+pub async fn build_state_with_cloud_ip(
+    sb: &MockServer,
+    cloud_ip: &str,
+    port_mappings: &[(&str, &str)],
+) -> Arc<AppState> {
+    sb_get(
+        sb,
+        users_fs_path(),
+        200,
+        &users_json_with_ports(cloud_ip, port_mappings),
+    )
+    .await;
+    build_state(&sb.uri())
 }
 
 /// Body-less request (GET/HEAD or empty POST).
@@ -199,10 +254,10 @@ pub async fn body_json(resp: Response<Body>) -> serde_json::Value {
     serde_json::from_slice(&body_bytes(resp).await).unwrap()
 }
 
-/// Mount the users registry on the SB mock, then log the default user in
-/// via `POST /api/login {key}` and return the `name=value` cookie pair.
-pub async fn login_as(app: &Router, sb: &MockServer, devices: &[&str]) -> String {
-    sb_get(sb, users_fs_path(), 200, &users_json(devices)).await;
+/// POST `/api/login` against an already-mounted registry and return the
+/// `name=value` cookie pair. For tests that mount their own registry
+/// document (e.g. via [`build_state_with_cloud_ip`]).
+pub async fn login_mounted(app: &Router) -> String {
     let resp = send(
         app,
         json_req(
@@ -227,6 +282,13 @@ pub async fn login_as(app: &Router, sb: &MockServer, devices: &[&str]) -> String
         .unwrap()
         .to_string();
     set_cookie.split(';').next().unwrap().trim().to_string()
+}
+
+/// Mount the users registry on the SB mock, then log the default user in
+/// via `POST /api/login` and return the `name=value` cookie pair.
+pub async fn login_as(app: &Router, sb: &MockServer, devices: &[&str]) -> String {
+    sb_get(sb, users_fs_path(), 200, &users_json(devices)).await;
+    login_mounted(app).await
 }
 
 /// [`login_as`] with the suite-wide [`DEFAULT_DEVICES`] list.

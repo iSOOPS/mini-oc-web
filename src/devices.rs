@@ -2,8 +2,8 @@ use crate::error::{AppError, AppResult};
 use crate::sb::SbClient;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::OnceLock;
+use std::time::Duration;
 
 pub const DEVICES_PATH: &str = "serv/opencode/{user}/devices.json";
 
@@ -68,60 +68,85 @@ impl Device {
     }
 }
 
-pub struct DevicesCache {
-    sb: std::sync::Arc<SbClient>,
-    sb_user: String,
-    ttl: Duration,
-    state: Mutex<Option<(Instant, DevicesFile)>>,
+/// Result of probing one device's `GET /status` endpoint via the user's
+/// cloud tunnel. Never throws — failures are encoded as
+/// `online=false` with a `reason` string.
+#[derive(Debug, Clone)]
+pub struct DeviceProbeResult {
+    pub online: bool,
+    pub reason: Option<String>,
+    pub status: Option<serde_json::Value>,
 }
 
-impl DevicesCache {
-    pub fn new(sb: std::sync::Arc<SbClient>, sb_user: impl Into<String>, ttl: Duration) -> Self {
+/// Probe `{cloud_ip}:{port}/status` with a 4s per-request timeout. Empty
+/// credentials — the BFF→device health probe is credential-free by
+/// design (ADR #13). Any failure (connection refused, timeout, non-2xx,
+/// body parse error) is captured as `online=false` with a `reason`.
+pub async fn probe_device_status(cloud_ip: &str, port: u16) -> DeviceProbeResult {
+    let url = format!("http://{cloud_ip}:{port}/status");
+    let http = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(4))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return DeviceProbeResult {
+                online: false,
+                reason: Some(format!("client build: {e}")),
+                status: None,
+            }
+        }
+    };
+    match http.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
+            Ok(s) => DeviceProbeResult { online: true, reason: None, status: Some(s) },
+            Err(e) => DeviceProbeResult {
+                online: false,
+                reason: Some(format!("body parse: {e}")),
+                status: None,
+            },
+        },
+        Ok(resp) => DeviceProbeResult {
+            online: false,
+            reason: Some(format!("device returned HTTP {}", resp.status())),
+            status: None,
+        },
+        Err(e) => DeviceProbeResult {
+            online: false,
+            reason: Some(e.to_string()),
+            status: None,
+        },
+    }
+}
+
+/// Thin store wrapping `SbClient` directly — no in-process TTL. Each
+/// `load()` hits SB fresh (ADR #21).
+pub struct DevicesStore {
+    sb: std::sync::Arc<SbClient>,
+    sb_user: String,
+}
+
+impl DevicesStore {
+    pub fn new(sb: std::sync::Arc<SbClient>, sb_user: impl Into<String>) -> Self {
         Self {
             sb,
             sb_user: sb_user.into(),
-            ttl,
-            state: Mutex::new(None),
         }
     }
 
+    /// Load `serv/opencode/{user}/devices.json`. Missing file → empty
+    /// registry (no end-side registrations yet). Always hits SB.
     pub async fn load(&self) -> AppResult<DevicesFile> {
-        let now = Instant::now();
-        {
-            let state = self.state.lock().unwrap();
-            if let Some((ts, df)) = state.as_ref() {
-                if now.duration_since(*ts) < self.ttl {
-                    return Ok(df.clone());
-                }
-            }
-        }
         let path = DEVICES_PATH.replace("{user}", &self.sb_user);
         let body = match self.sb.get_fs(&path).await {
             Ok(b) => b,
             Err(AppError::NotFound(_)) => {
-                let df = DevicesFile {
-                    version: 1,
-                    devices: Vec::new(),
-                };
-                *self.state.lock().unwrap() = Some((now, df.clone()));
-                return Ok(df);
-            }
-            Err(AppError::ServiceUnavailable(msg)) => {
-                return Err(AppError::ServiceUnavailable(format!(
-                    "devices cache unavailable: {}",
-                    msg
-                )));
+                return Ok(DevicesFile { version: 1, devices: Vec::new() });
             }
             Err(e) => return Err(e),
         };
-        let df: DevicesFile = serde_json::from_str(&body)
-            .map_err(|e| AppError::Internal(format!("devices.json parse: {}", e)))?;
-        *self.state.lock().unwrap() = Some((now, df.clone()));
-        Ok(df)
-    }
-
-    pub async fn invalidate(&self) {
-        self.state.lock().unwrap().take();
+        serde_json::from_str(&body)
+            .map_err(|e| AppError::Internal(format!("devices.json parse: {}", e)))
     }
 }
 
@@ -135,5 +160,37 @@ pub fn validate_pcname(s: &str) -> AppResult<()> {
         Ok(())
     } else {
         Err(AppError::InvalidPcname(s.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn devices_store_load_hits_sb_every_call() {
+        let sb = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.fs/serv/opencode/admin/devices.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"version":1,"devices":[]}"#))
+            .expect(2)
+            .mount(&sb)
+            .await;
+        let store = DevicesStore::new(
+            std::sync::Arc::new(crate::sb::SbClient::new(sb.uri(), "admin", "pw").unwrap()),
+            "admin",
+        );
+        let _ = store.load().await.unwrap();
+        let _ = store.load().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn probe_device_status_returns_offline_when_unreachable() {
+        // Probe a port nothing listens on → must return online=false within ~5s
+        let result = probe_device_status("127.0.0.1", 1).await; // port 1 = unreachable
+        assert!(!result.online, "expected offline, got: {:?}", result);
+        assert!(result.reason.is_some());
     }
 }

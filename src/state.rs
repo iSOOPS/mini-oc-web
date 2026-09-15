@@ -1,7 +1,7 @@
 use crate::auth::RateLimiter;
-use crate::devices::DevicesCache;
+use crate::devices::DevicesStore;
 use crate::sb::SbClient;
-use crate::users::UsersCache;
+use crate::users::UsersStore;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -65,8 +65,8 @@ pub struct AppConfig {
 pub struct AppState {
     pub config: AppConfig,
     pub sb: Arc<SbClient>,
-    pub devices: Arc<DevicesCache>,
-    pub users: Arc<UsersCache>,
+    pub devices: Arc<DevicesStore>,
+    pub users: Arc<UsersStore>,
     pub rate_limiter: Arc<RateLimiter>,
     pub device_creds: Arc<DeviceCreds>,
     /// Process start marker for /api/admin/info uptime.
@@ -103,8 +103,8 @@ impl AppState {
 
         let sb = Arc::new(SbClient::new(sb_base_url.clone(), sb_user.clone(), sb_password.clone())?);
         sb.login().await?;
-        let devices = Arc::new(DevicesCache::new(sb.clone(), sb_user.clone(), Duration::from_secs(30)));
-        let users = Arc::new(UsersCache::new(sb.clone(), Duration::from_secs(30)));
+        let devices = Arc::new(DevicesStore::new(sb.clone(), sb_user.clone()));
+        let users = Arc::new(UsersStore::new(sb.clone(), sb_user.clone()));
         let rate_limiter = Arc::new(RateLimiter::new(5, Duration::from_secs(600)));
 
         let portal_base = std::env::var("PORTAL_BASE")

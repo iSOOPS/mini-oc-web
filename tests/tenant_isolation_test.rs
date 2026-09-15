@@ -132,8 +132,8 @@ async fn deleted_user_session_becomes_unauthorized() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     // "Delete" the user by serving an empty registry on the next load.
-    // The UsersCache TTL (30s) would normally hold the old value, so
-    // invalidate by pointing a fresh state at a registry without the user.
+    // There is no cache anymore — every load() reads SB directly — so
+    // pointing a fresh state at a registry without the user suffices.
     let sb2 = MockServer::start().await;
     sb_get_404(&sb2, users_fs_path()).await;
     let app2 = test_app(build_state(&sb2.uri()));

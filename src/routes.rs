@@ -1,6 +1,7 @@
 use crate::auth::{sign_cookie, verify_cookie};
 use crate::devices::{
-    path_list_path, validate_pcname, Device, DevicesFile, PathListEntry, DEVICES_PATH,
+    path_list_path, probe_device_status, validate_pcname, Device, DevicesFile, PathListEntry,
+    DEVICES_PATH,
 };
 use crate::error::{AppError, AppResult};
 use crate::jump::{
@@ -18,6 +19,7 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json as AxumJson, Router};
+use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -287,18 +289,47 @@ async fn login(
     }
 }
 
-/// Who am I: the signed-in user's portal profile (no key material).
+/// Who am I: the signed-in user's portal profile (no key material) with
+/// every assigned device's runtime status probed concurrently via the
+/// user's cloud tunnel (`http://{cloud_ip}:{port}/status`).
 async fn me(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> AppResult<AxumJson<serde_json::Value>> {
     let user = current_user(&state, &headers).await?;
+    let probes = user
+        .devices
+        .iter()
+        .map(|d| probe_device_status(&user.cloud_ip, d.port))
+        .collect::<Vec<_>>();
+    let results = join_all(probes).await;
+
+    let mut enriched: Vec<serde_json::Value> = Vec::with_capacity(user.devices.len());
+    for (ud, pr) in user.devices.iter().zip(results.into_iter()) {
+        let mut entry = serde_json::json!({
+            "desc": ud.desc,
+            "name": ud.name,
+            "port": ud.port,
+            "device-name": ud.device_name,
+            "pctype": ud.pctype,
+            "bound": ud.bound,
+            "online": pr.online,
+        });
+        if let Some(r) = pr.reason {
+            entry["reason"] = serde_json::Value::String(r);
+        }
+        if let Some(s) = pr.status {
+            entry["status"] = s;
+        }
+        enriched.push(entry);
+    }
+
     Ok(AxumJson(serde_json::json!({
         "id": user.id,
         "name": user.name,
         "cloud_ip": user.cloud_ip,
         "last_used_at": user.last_used_at,
-        "devices": user.devices,
+        "devices": enriched,
         "sb": user.sb,
     })))
 }
@@ -655,9 +686,9 @@ async fn device_detail(
     })))
 }
 
-/// Remove a device from `devices.json` (read-modify-write, then cache
-/// invalidate). Used by the SPA for manually-added (seeded) device cards;
-/// end-side registered devices manage their own lifecycle.
+/// Remove a device from `devices.json` (read-modify-write). Used by the
+/// SPA for manually-added (seeded) device cards; end-side registered
+/// devices manage their own lifecycle.
 async fn device_delete(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -677,7 +708,6 @@ async fn device_delete(
     let json = serde_json::to_string_pretty(&df)
         .map_err(|e| AppError::Internal(format!("devices serialize: {}", e)))?;
     state.sb.put_fs(&path, &json).await?;
-    state.devices.invalidate().await;
     Ok(AxumJson(serde_json::json!({ "ok": true })))
 }
 
@@ -715,7 +745,6 @@ async fn devices_seed(
     let json = serde_json::to_string_pretty(&df)
         .map_err(|e| AppError::Internal(format!("devices serialize: {}", e)))?;
     state.sb.put_fs(&path, &json).await?;
-    state.devices.invalidate().await;
     Ok(AxumJson(serde_json::json!({"ok": true})))
 }
 
@@ -1168,10 +1197,10 @@ async fn admin_users_create(
     require_admin(&headers, &state.config.cookie_key)?;
     body.validate()?;
     // Pull the registry straight from the remote config document
-    // (web/opencode/config.md served by SB) instead of the TTL cache:
-    // the 6-digit id space is small, so uniqueness must be checked
-    // against the freshest remote state.
-    let mut uf = state.users.load_fresh().await?;
+    // (web/opencode/config.md served by SB): the 6-digit id space is
+    // small, so uniqueness must be checked against the freshest
+    // remote state. UsersStore::load always hits SB — no cache.
+    let mut uf = state.users.load().await?;
     if uf.users.iter().any(|u| u.name == body.name) {
         return Err(AppError::InvalidTarget(format!(
             "user name already exists: {}",
