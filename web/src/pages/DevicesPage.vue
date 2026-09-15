@@ -80,7 +80,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { UnauthorizedError } from '../api'
-import type { DeviceStatus, UserDevice } from '../api'
+import type { UserDevice } from '../api'
 import { useAuthStore } from '../store'
 import LoadingOverlay from '../components/LoadingOverlay.vue'
 
@@ -104,8 +104,6 @@ async function refreshAll() {
       await auth.probe(ctrl.signal)
     } catch (e) {
       if (e instanceof UnauthorizedError) return
-      refreshing.value = null
-      refreshAbort = null
       showToast('刷新设备清单失败，请稍后重试', 'warn')
       return
     }
