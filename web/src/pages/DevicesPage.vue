@@ -44,11 +44,12 @@
           </div>
           <!-- 行3 状态行 -->
           <div class="card-status muted small">
-            <div v-if="statusOf(d)">
+            <div v-if="d.online !== undefined">
               <span :class="ocServe(d) === 'running' ? 'ok-text' : 'warn-text'">
                 oc serve {{ ocServe(d) }}
               </span>
               <template v-if="hostOf(d)"> · {{ hostOf(d) }}</template>
+              <span v-if="!d.online && d.reason" class="warn-text"> · {{ d.reason }}</span>
             </div>
             <div v-else>状态未知</div>
           </div>
@@ -78,7 +79,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { apiGet, UnauthorizedError } from '../api'
+import { UnauthorizedError } from '../api'
 import type { DeviceStatus, UserDevice } from '../api'
 import { useAuthStore } from '../store'
 import LoadingOverlay from '../components/LoadingOverlay.vue'
@@ -96,60 +97,19 @@ async function refreshAll() {
   if (refreshing.value !== null) return         // 防重入
   const ctrl = new AbortController()
   refreshAbort = ctrl
-  const initialDevices = auth.me?.devices ?? []
-  refreshing.value = { done: 0, total: initialDevices.length }
+  refreshing.value = { done: 0, total: 1 }   // 单次 /api/me 调用
 
   try {
-    // (a) 重拉 /api/me
-    // probe() 不抛 UnauthorizedError/network 错误——只抛 AbortError 并返回 false。
-    // 401 与网络错误的区分靠 me 是否被清空（probe 内部约定）。
-    const ok = await auth.probe(ctrl.signal).catch(() => false)
-    if (ctrl.signal.aborted) return             // 阶段 (a) 被取消
-    if (!ok) {
-      if (auth.me === null) {                   // 401：probe 已清空 me
-        refreshing.value = null
-        refreshAbort = null
-        router.push('/login')                   // 路由守卫会接管后续；这里显式触发
-        return
-      }
-      // 网络/5xx：probe 保留旧 me（按 store.ts 的「不轻易登出」约定）
+    try {
+      await auth.probe(ctrl.signal)
+    } catch (e) {
+      if (e instanceof UnauthorizedError) return
       refreshing.value = null
       refreshAbort = null
       showToast('刷新设备清单失败，请稍后重试', 'warn')
       return
     }
-
-    // (b) 并发刷 device-status（批 ≤ 6）
-    const devices = auth.me?.devices ?? []
-    const BATCH = 6
-    for (let i = 0; i < devices.length; i += BATCH) {
-      if (ctrl.signal.aborted) break
-      const batch = devices.slice(i, i + BATCH)
-      await Promise.allSettled(
-        batch.map((d) =>
-          apiGet<DeviceStatus>(`/api/device-status/${d.port}`, { signal: ctrl.signal })
-            .then((r) => {
-              // Race guard: fetch 可能在 abort 后才 resolve（极少数情况），
-              // 此时已不算「本次刷新」的结果，不写入 statuses。
-              if (ctrl.signal.aborted) return
-              statuses.value = { ...statuses.value, [d.port]: r }
-            })
-            .catch((e) => {
-              // 批次中若出现 401，由页面级路由守卫在下次导航时兜底跳 /login。
-              if (ctrl.signal.aborted) return
-              statuses.value = {
-                ...statuses.value,
-                [d.port]: { online: false, reason: e instanceof Error ? e.message : String(e) },
-              }
-            })
-            .finally(() => {
-              if (refreshing.value) {
-                refreshing.value = { ...refreshing.value, done: refreshing.value.done + 1 }
-              }
-            }),
-        ),
-      )
-    }
+    if (ctrl.signal.aborted) return
   } finally {
     const wasCancelled = ctrl.signal.aborted
     refreshing.value = null
@@ -165,21 +125,6 @@ function cancelRefresh() {
 async function silentFirstLoad() {
   // 1) 拿到最新设备清单（无 signal、不弹菊花）。401 由路由守卫处理。
   await auth.probe().catch(() => {})
-  const devices = auth.me?.devices ?? []
-  // 2) fire-and-forget 触发每台设备状态探测。不 await、不写 refreshing。
-  for (const d of devices) {
-    apiGet<DeviceStatus>(`/api/device-status/${d.port}`)
-      .then((r) => {
-        statuses.value = { ...statuses.value, [d.port]: r }
-      })
-      .catch((e) => {
-        if (e instanceof UnauthorizedError) return
-        statuses.value = {
-          ...statuses.value,
-          [d.port]: { online: false, reason: e instanceof Error ? e.message : String(e) },
-        }
-      })
-  }
 }
 
 // 用户设备清单（管理员授权）直接驱动卡片;状态通过云隧道主动探测。
@@ -191,23 +136,17 @@ function displayName(d: UserDevice): string {
   return d['device-name'] || d.desc || d.name
 }
 
-// port → 探测结果
-const statuses = ref<Record<number, DeviceStatus>>({})
-
-function statusOf(d: UserDevice): DeviceStatus | undefined {
-  return statuses.value[d.port]
-}
 function isOnline(d: UserDevice): boolean {
-  return statusOf(d)?.online === true
+  return d.online === true
 }
 function ocServe(d: UserDevice): string {
-  return statusOf(d)?.status?.opencode_serve ?? 'unknown'
+  return d.status?.opencode_serve ?? 'unknown'
 }
 function rathole(d: UserDevice): string {
-  return statusOf(d)?.status?.rathole ?? 'unknown'
+  return d.status?.rathole ?? 'unknown'
 }
 function hostOf(d: UserDevice): string {
-  return statusOf(d)?.status?.system?.hostname ?? ''
+  return d.status?.system?.hostname ?? ''
 }
 
 /**
@@ -217,9 +156,8 @@ function hostOf(d: UserDevice): string {
  * 绿 = 完全可用；灰 = 探测中 / 状态未知（数据未到不闪红黄）
  */
 function dotClass(d: UserDevice): string {
-  const st = statusOf(d)
-  if (!st) return 'offline'
-  if (!st.online || rathole(d) !== 'running') return 'danger'
+  if (d.online === undefined) return 'offline'           // data not arrived yet (silentFirstLoad in flight)
+  if (!d.online || rathole(d) !== 'running') return 'danger'
   if (!d.bound || ocServe(d) !== 'running') return 'warn'
   return 'online'
 }
@@ -272,7 +210,7 @@ function onDeviceClick(d: UserDevice) {
   }
   // 绿点：完全可用。保留旧代码的 os 兜底（状态快照缺 os 时无法
   // 构造合法跳转路径，不属导航地址变更）。
-  const os = statusOf(d)?.status?.system?.os
+  const os = d.status?.system?.os
   if (os !== 'macos' && os !== 'windows') {
     showToast(`设备「${name}」系统类型不支持，无法进入项目列表`, 'muted')
     return
