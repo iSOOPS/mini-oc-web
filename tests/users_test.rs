@@ -47,9 +47,11 @@ async fn users_store_load_parses_document() {
             desc: d.to_string(),
             name: d.to_string(),
             port: 4040,
+            oc_port: 9464,
             device_name: String::new(),
             pctype: "windows".into(),
             bound: false,
+            public_url: String::new(),
         })
         .collect();
     assert_eq!(uf.users[0].devices, expected);
@@ -250,7 +252,6 @@ async fn legacy_string_devices_registry_still_logs_in() {
     })
     .to_string();
     sb_get(&sb, users_fs_path(), 200, &legacy).await;
-    sb_get_404(&sb, &devices_fs_path()).await;
     let app = test_app(build_state(&sb.uri()));
 
     let resp = send(

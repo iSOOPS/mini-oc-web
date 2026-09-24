@@ -5,7 +5,6 @@
 //! The BFF (via the admin API) is the only writer; end-sides never touch
 //! it. Reads hit SB directly on every call (no in-process cache).
 
-use crate::devices::validate_pcname;
 use crate::error::{AppError, AppResult};
 use crate::sb::SbClient;
 use regex::Regex;
@@ -22,9 +21,12 @@ const KEY_ALPHABET: &[u8] =
 const KEY_LEN: usize = 32;
 
 /// One entry of a user's device list ("设备清单"): the human-readable
-/// description (`desc`), the device's service name, the port its opencode
-/// service listens on, the device name written by the binding client,
-/// the platform type, and the binding status.
+/// description (`desc`), the device's service name, the local TUI service
+/// port (mini-oc-gui), the opencode server port the TUI launches, the
+/// device name written by the binding client, the platform type, the
+/// binding status, and the device's tunnel address (`public_url` —
+/// admin-assigned `scheme://host` with NO port: the BFF reaches the TUI
+/// at `{public_url}:{port}` and opencode at `{public_url}:{oc_port}`).
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct UserDevice {
     /// Human-readable description (描述), display-only; 1-64 chars
@@ -33,11 +35,19 @@ pub struct UserDevice {
     /// registry entries keep loading and migrate on the next save).
     #[serde(rename = "desc")]
     pub desc: String,
-    /// Device service name: lowercase letters/digits/hyphen only
+    /// Device service name: lowercase letters/digits/hyphens only
     /// (`^[a-z0-9-]{1,64}$`) — it becomes path/URL material.
     pub name: String,
-    /// Service port (1-65535).
+    /// 服务端口号：the local TUI service port (mini-oc-gui, device
+    /// default 9465). The BFF probes `{public_url}:{port}/status` and
+    /// targets `{public_url}:{port}` for the TUI's `/project`,
+    /// `/api/session` endpoints.
     pub port: u16,
+    /// OpenCode 端口号：the port the TUI launches `opencode serve` on
+    /// (device default 9464). The BFF builds browser jump URLs as
+    /// `{public_url}:{oc_port}/...`. Must differ from `port`.
+    #[serde(rename = "oc-port", default = "default_oc_port")]
+    pub oc_port: u16,
     /// 设备名称（device-name）：由设备客户端绑定时（POST
     /// /api/device-bind）自动写入；管理端不可编辑。Empty = not yet
     /// written by a binding client.
@@ -52,6 +62,22 @@ pub struct UserDevice {
     /// user; defaults to false for legacy registry entries.
     #[serde(default)]
     pub bound: bool,
+    /// 设备穿透地址（tunnel address）, admin-assigned as a bare
+    /// `scheme://host` (IP or domain, http/https — NO port, NO path).
+    /// The BFF reaches the TUI at `{public_url}:{port}` and opencode at
+    /// `{public_url}:{oc_port}`. Empty (legacy registry entries only —
+    /// new writes are validated non-empty) means the device cannot be
+    /// probed and is reported offline with a "not configured" reason.
+    #[serde(rename = "public-url", default)]
+    pub public_url: String,
+}
+
+/// Default opencode server port — mirrors mini-oc-gui's
+/// `DEFAULT_OPENCODE_PORT` (its TUI launches `opencode serve --port
+/// 9464`). Legacy registry entries without an explicit `oc-port`
+/// deserialize with this value.
+fn default_oc_port() -> u16 {
+    9464
 }
 
 /// Platform types a device entry may declare (mirrors the SB path-list
@@ -86,12 +112,16 @@ impl<'de> Deserialize<'de> for UserDevice {
                 name: String,
                 #[serde(default = "legacy_default_port")]
                 port: u16,
+                #[serde(rename = "oc-port", default = "default_oc_port")]
+                oc_port: u16,
                 #[serde(rename = "device-name", default)]
                 device_name: String,
                 #[serde(rename = "pctype", default)]
                 pctype: String,
                 #[serde(default)]
                 bound: bool,
+                #[serde(rename = "public-url", default)]
+                public_url: String,
             },
             Legacy(String),
         }
@@ -104,24 +134,30 @@ impl<'de> Deserialize<'de> for UserDevice {
                 desc,
                 name,
                 port,
+                oc_port,
                 device_name,
                 pctype,
                 bound,
+                public_url,
             } => UserDevice {
                 desc,
                 name,
                 port,
+                oc_port,
                 device_name,
                 pctype,
                 bound,
+                public_url,
             },
             Wire::Legacy(name) => UserDevice {
                 desc: String::new(),
                 name,
                 port: LEGACY_DEFAULT_PORT,
+                oc_port: default_oc_port(),
                 device_name: String::new(),
                 pctype: String::new(),
                 bound: false,
+                public_url: String::new(),
             },
         })
     }
@@ -218,25 +254,6 @@ fn default_cloud_ip() -> String {
     DEFAULT_CLOUD_IP.to_string()
 }
 
-/// Accept an IPv4/IPv6 literal or a plain hostname (letters, digits,
-/// hyphens, dots). Keeps `cloud_ip` from smuggling URL syntax into the
-/// status-probe URL.
-pub fn validate_cloud_ip(s: &str) -> AppResult<()> {
-    let trimmed = s.trim();
-    if trimmed.parse::<std::net::IpAddr>().is_ok() {
-        return Ok(());
-    }
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| {
-        Regex::new(r"^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$").unwrap()
-    });
-    if !trimmed.is_empty() && trimmed.len() <= 64 && re.is_match(trimmed) {
-        Ok(())
-    } else {
-        Err(AppError::InvalidTarget(format!("invalid cloud ip: {}", s)))
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UsersFile {
     pub version: u32,
@@ -317,10 +334,48 @@ fn migrate_legacy_ids(uf: &mut UsersFile) -> bool {
     changed
 }
 
+/// Strip any explicit `:port` from legacy `public-url` values — the port
+/// now lives in the dedicated `port` (TUI) / `oc-port` (opencode) fields,
+/// so a legacy `http://host:9464` becomes `http://host` and both composed
+/// addresses derive from the fields. Returns whether anything changed.
+/// Unparseable values are left untouched for write-time validation.
+fn migrate_device_urls(uf: &mut UsersFile) -> bool {
+    let mut changed = false;
+    for u in &mut uf.users {
+        for d in &mut u.devices {
+            let Ok(mut parsed) = url::Url::parse(d.public_url.trim()) else {
+                continue;
+            };
+            if parsed.port().is_some() {
+                let _ = parsed.set_port(None);
+                parsed.set_path("");
+                let stripped = parsed.as_str().trim_end_matches('/').to_string();
+                tracing::info!(
+                    "migrating device {} public-url {} -> {} (port moved to port/oc-port fields)",
+                    d.name,
+                    d.public_url,
+                    stripped
+                );
+                d.public_url = stripped;
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 /// Portal user names follow the device-name whitelist so they stay
-/// path/URL-safe wherever we print them.
+/// path/URL-safe wherever we print them. Whitelist:
+/// `[A-Za-z0-9_-]{1,64}` (mirrors the device-side whitelist in
+/// `routes.rs::validate_pcname`).
 pub fn validate_user_name(s: &str) -> AppResult<()> {
-    validate_pcname(s)
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"^[A-Za-z0-9_-]{1,64}$").unwrap());
+    if re.is_match(s) {
+        Ok(())
+    } else {
+        Err(AppError::InvalidPcname(s.to_string()))
+    }
 }
 
 /// Validate a user's device list: non-empty; every entry carries a
@@ -329,8 +384,10 @@ pub fn validate_user_name(s: &str) -> AppResult<()> {
 /// letters/digits/hyphen ONLY — no underscore, no symbols, no
 /// uppercase); every `pctype` is one of [`DEVICE_PCTYPES`] (windows /
 /// macos, same enum as the SB path-list platform type); every port is
-/// 1-65535; no duplicate service names. `device-name` is client-written
-/// (not admin-editable) — only length/control-char sanity is enforced.
+/// 1-65535; every `public_url` is an http(s) URL (admin-assigned
+/// reachable address); no duplicate service names. `device-name` is
+/// client-written (not admin-editable) — only length/control-char sanity
+/// is enforced.
 pub fn validate_user_devices(devices: &[UserDevice]) -> AppResult<()> {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| Regex::new(r"^[a-z0-9-]{1,64}$").unwrap());
@@ -385,6 +442,51 @@ pub fn validate_user_devices(devices: &[UserDevice]) -> AppResult<()> {
                 d.name
             )));
         }
+        if d.oc_port == 0 {
+            return Err(AppError::InvalidTarget(format!(
+                "bad oc-port for {}: must be 1-65535",
+                d.name
+            )));
+        }
+        if d.oc_port == d.port {
+            return Err(AppError::InvalidTarget(format!(
+                "bad oc-port for {}: must differ from the TUI service port {} \
+                 (the device TUI rejects equal ports too)",
+                d.name, d.port
+            )));
+        }
+        // public_url: a bare tunnel address `http(s)://host` — IP or
+        // domain, NO port (ports come from `port` / `oc-port`), NO path.
+        // The BFF composes every device URL from it, so bad input is
+        // caught here at write time.
+        let url = d.public_url.trim();
+        if url.is_empty() {
+            return Err(AppError::InvalidTarget(format!(
+                "bad public-url for {}: must not be empty",
+                d.name
+            )));
+        }
+        match url::Url::parse(url) {
+            Ok(u)
+                if (u.scheme() == "http" || u.scheme() == "https")
+                    && u.host_str().is_some()
+                    && !u.host_str().unwrap_or("").is_empty()
+                    && u.port().is_none()
+                    && (u.path() == "/" || u.path().is_empty()) => {}
+            Ok(u) => {
+                return Err(AppError::InvalidTarget(format!(
+                    "bad public-url for {}: {} (must be http(s)://host — \
+                     IP or domain, no port, no path)",
+                    d.name, u
+                )));
+            }
+            Err(e) => {
+                return Err(AppError::InvalidTarget(format!(
+                    "bad public-url for {}: {}",
+                    d.name, e
+                )));
+            }
+        }
         if !seen.insert(d.name.as_str()) {
             return Err(AppError::InvalidTarget(format!(
                 "duplicate device name: {}",
@@ -401,11 +503,6 @@ pub fn validate_user_devices(devices: &[UserDevice]) -> AppResult<()> {
 /// outweighed its perf benefit.
 pub struct UsersStore {
     sb: Arc<SbClient>,
-    /// Path is a fixed constant `web/opencode/config.md` (no `{user}`
-    /// placeholder, unlike `DEVICES_PATH`). Currently unread; the
-    /// constructor accepts `sb_user` to keep parity with `DevicesStore`
-    /// (which DOES need it) and for future per-user paths if/when the
-    /// user registry is split. Tracked for removal in Task 4 cleanup.
     #[allow(dead_code)]
     sb_user: String,
 }
@@ -429,7 +526,9 @@ impl UsersStore {
         };
         let mut uf: UsersFile = serde_json::from_str(&body)
             .map_err(|e| AppError::Internal(format!("users config parse: {}", e)))?;
-        if migrate_legacy_ids(&mut uf) {
+        let mut changed = migrate_legacy_ids(&mut uf);
+        changed |= migrate_device_urls(&mut uf);
+        if changed {
             let body = serialize_users_file(&uf)?;
             self.sb.put_fs(USERS_PATH, &body).await?;
         }
@@ -539,17 +638,21 @@ mod tests {
                         desc: "Samuel 的 MacBook".into(),
                         name: "samuel-mac".into(),
                         port: 9464,
+                        oc_port: 18800,
                         device_name: "SAMUEL-MBP".into(),
                         pctype: "macos".into(),
                         bound: true,
+                        public_url: "https://oc-mac.isoops.com".into(),
                     },
                     UserDevice {
                         desc: "Samuel 的 Windows".into(),
                         name: "samuel-win".into(),
                         port: 4040,
+                        oc_port: 9464,
                         device_name: String::new(),
                         pctype: "windows".into(),
                         bound: false,
+                        public_url: "https://oc-win.isoops.com".into(),
                     },
                 ],
                 sb: UserSbConfig {
@@ -630,9 +733,11 @@ mod tests {
             desc: desc.into(),
             name: name.into(),
             port,
+            oc_port: 9464,
             device_name: String::new(),
             pctype: "windows".into(),
             bound: false,
+            public_url: "https://oc-mac.example.com".into(),
         };
         assert!(validate_user_devices(&[ok("办公本", "a", 1)]).is_ok());
         assert!(validate_user_devices(&[ok("dev 01", "dev-01", 65535)]).is_ok());
@@ -712,6 +817,71 @@ mod tests {
                 "URL-structure char {bad_char:?} in device-name rejected"
             );
         }
+        // public-url: empty / non-http / bad scheme / with path → rejected.
+        let mut no_url = ok("a", "a", 1);
+        no_url.public_url = String::new();
+        assert!(
+            validate_user_devices(&[no_url]).is_err(),
+            "empty public-url rejected"
+        );
+        let mut ws_url = ok("a", "a", 1);
+        ws_url.public_url = "   ".into();
+        assert!(
+            validate_user_devices(&[ws_url]).is_err(),
+            "whitespace-only public-url rejected"
+        );
+        let mut ftp = ok("a", "a", 1);
+        ftp.public_url = "ftp://example.com".into();
+        assert!(
+            validate_user_devices(&[ftp]).is_err(),
+            "non-http(s) scheme rejected"
+        );
+        let mut with_path = ok("a", "a", 1);
+        with_path.public_url = "https://example.com/some/path".into();
+        assert!(
+            validate_user_devices(&[with_path]).is_err(),
+            "public-url with path rejected"
+        );
+        let mut no_host = ok("a", "a", 1);
+        no_host.public_url = "https://".into();
+        assert!(
+            validate_user_devices(&[no_host]).is_err(),
+            "public-url without host rejected"
+        );
+        // public-url is a bare tunnel address: ports are rejected — they
+        // live in the dedicated `port` / `oc-port` fields.
+        let mut with_port = ok("a", "a", 1);
+        with_port.public_url = "http://10.0.0.1:9464".into();
+        assert!(
+            validate_user_devices(&[with_port]).is_err(),
+            "public-url with port rejected"
+        );
+        let mut http_ok = ok("a", "a", 1);
+        http_ok.public_url = "http://10.0.0.1".into();
+        assert!(
+            validate_user_devices(&[http_ok]).is_ok(),
+            "http://host accepted"
+        );
+        let mut https_ok = ok("a", "a", 1);
+        https_ok.public_url = "https://oc-mac.isoops.com".into();
+        assert!(
+            validate_user_devices(&[https_ok]).is_ok(),
+            "https://host accepted"
+        );
+        // oc-port: 0 rejected; equal to the TUI service port rejected
+        // (mirrors the device TUI's own submit_settings rule).
+        let mut oc_zero = ok("a", "a", 1);
+        oc_zero.oc_port = 0;
+        assert!(
+            validate_user_devices(&[oc_zero]).is_err(),
+            "oc-port 0 rejected"
+        );
+        let mut oc_same = ok("a", "a", 9464);
+        oc_same.oc_port = 9464;
+        assert!(
+            validate_user_devices(&[oc_same]).is_err(),
+            "oc-port equal to service port rejected"
+        );
     }
 
     #[test]
@@ -744,9 +914,11 @@ mod tests {
                 desc: desc.into(),
                 name: name.into(),
                 port,
+                oc_port: 9464,
                 device_name: device_name.into(),
                 pctype: pctype.into(),
                 bound,
+                public_url: String::new(),
             }
         };
         assert_eq!(

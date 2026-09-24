@@ -18,7 +18,7 @@
       <a
         v-for="s in sessions"
         :key="s.id"
-        :href="jumpUrls[s.id] || fallbackHref(s.id)"
+        :href="sessionHref(s.id) || '#'"
         target="_blank"
         rel="noopener"
         class="session-card"
@@ -37,15 +37,6 @@
       {{ creating ? '创建中…' : '+ 新建会话' }}
     </button>
 
-    <DeviceAuthDialog
-      :visible="authVisible"
-      :base-url="authBaseUrl"
-      :busy="authBusy"
-      :error="authError"
-      @submit="submitAuth"
-      @cancel="cancelAuth"
-    />
-
     <NewSessionDialog
       :visible="nsVisible"
       :projects="[]"
@@ -63,22 +54,14 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
-import DeviceAuthDialog from '../components/DeviceAuthDialog.vue'
 import NewSessionDialog from '../components/NewSessionDialog.vue'
-import { useDeviceAuth } from '../deviceAuth'
-import { apiGet, apiPost, ApiError, DEVICE_AUTH_FAILED, UnauthorizedError } from '../api'
-import type { DeviceView, SessionInfo } from '../api'
+import { useAuthStore } from '../store'
+import { apiGet, apiPost, UnauthorizedError } from '../api'
+import type { DeviceDetail, SessionInfo } from '../api'
+import { buildOcSessionUrl } from '../oc-url'
 
 const route = useRoute()
-const {
-  visible: authVisible,
-  busy: authBusy,
-  error: authError,
-  baseUrl: authBaseUrl,
-  open: openAuth,
-  submit: submitAuth,
-  cancel: cancelAuth,
-} = useDeviceAuth()
+const auth = useAuthStore()
 const pctype = String(route.params.pctype)
 const pcname = String(route.params.pcname)
 const directory = String(route.query.directory ?? '')
@@ -87,23 +70,29 @@ const sessions = ref<SessionInfo[]>([])
 const loading = ref(true)
 const error = ref('')
 const creating = ref(false)
-const device = ref<DeviceView | null>(null)
-// sid -> BFF /jump 生成的跳转 URL；未拿到前用 fallbackHref 降级。
-const jumpUrls = ref<Record<string, string>>({})
+// 设备端 opencode serve 的 Basic 凭据（预取，失败静默）。sessionHref
+// 用它构造内嵌凭据的会话直达 URL（免 Basic Auth 弹窗）。
+const deviceDetail = ref<DeviceDetail | null>(null)
 
 const backToProjects = computed(
   () => `/devices/${pctype}/${encodeURIComponent(pcname)}/projects`,
 )
 
-// 本地 base64 计算的降级方案（与 BFF jump.rs 同一编码），/jump 请求失败时兜底。
-const fallbackHref = (sid: string) => {
-  if (!device.value) return '#'
-  // Same encoding as BFF jump.rs: URL-safe base64 of percent-encoded directory.
-  const b64dir = btoa(encodeURIComponent(directory))
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/, '')
-  return `${device.value.portal_base}/${device.value.pcname_b64}/${b64dir}/session/${sid}`
+/** 当前设备条目（admin 录入），从 auth.me 里直接拿。 */
+const deviceEntry = computed(() =>
+  auth.me?.devices.find((x) => x.pctype === pctype && x.name === pcname),
+)
+
+/**
+ * 会话直达 URL（2026-09-24 报告格式）：URL 内嵌凭据 + 规范路由
+ * `/server/{b64url(serverURL)}/session/{sid}`，浏览器自动携带
+ * Authorization 头，免原生 Basic Auth 弹窗。凭据或设备 URL 未就绪
+ * 时返回空串（模板降级为 '#'）。
+ */
+const sessionHref = (sid: string) => {
+  const d = deviceEntry.value
+  if (!d || !deviceDetail.value) return ''
+  return buildOcSessionUrl(d, deviceDetail.value, sid)
 }
 
 async function load() {
@@ -113,35 +102,21 @@ async function load() {
   }
   loading.value = true
   error.value = ''
+  // 凭据预取与 sessions 并行，不阻塞渲染；失败静默（fallbackHref
+  // 退化为无 token 裸链，行为同旧版）。
+  apiGet<DeviceDetail>(
+    `/api/devices/${pctype}/${encodeURIComponent(pcname)}/detail`,
+  )
+    .then((d) => {
+      deviceDetail.value = d
+    })
+    .catch(() => {})
   try {
-    // Pull device list so we have pcname_b64 + portal_base for jump URLs.
-    const list = await apiGet<DeviceView[]>('/api/devices')
-    device.value =
-      list.find((d) => d.pctype === pctype && d.pcname === pcname) ?? null
     sessions.value = await apiGet<SessionInfo[]>(
       `/api/devices/${pctype}/${encodeURIComponent(pcname)}/sessions?directory=${encodeURIComponent(directory)}`,
     )
-    // 并发为每个会话拉取 BFF /jump 生成的跳转 URL，不阻塞页面渲染；
-    // 单个失败静默，模板回退到 fallbackHref。
-    await Promise.all(
-      sessions.value.map(async (s) => {
-        try {
-          const r = await apiGet<{ jump_url: string }>(
-            `/api/devices/${pctype}/${encodeURIComponent(pcname)}/jump?directory=${encodeURIComponent(directory)}&session=${s.id}&format=json`,
-          )
-          jumpUrls.value[s.id] = r.jump_url
-        } catch {
-          // 静默：保留本地 fallbackHref
-        }
-      }),
-    )
   } catch (e) {
     if (e instanceof UnauthorizedError) return
-    // 设备端拒绝 BFF 凭据：弹授权框，通过后自动重载。
-    if (e instanceof ApiError && e.code === DEVICE_AUTH_FAILED) {
-      openAuth(pctype, pcname, device.value?.public_url ?? '', () => load())
-      return
-    }
     error.value = e instanceof Error ? e.message : String(e)
   } finally {
     loading.value = false
@@ -167,19 +142,16 @@ async function createSession(directory: string) {
   creating.value = true
   nsError.value = ''
   try {
-    const r = await apiPost<{ jump_url: string }>(
+    const r = await apiPost<{ id: string; jump_url: string }>(
       `/api/devices/${pctype}/${encodeURIComponent(pcname)}/sessions`,
       { directory },
     )
     nsVisible.value = false
-    // 新标签页打开（问题1），不离开当前列表页
-    window.open(r.jump_url, '_blank', 'noopener,noreferrer')
+    // 新标签页打开：优先免弹窗的自拼 URL；凭据未就绪时退回 BFF 的
+    // jump_url（旧格式，可能触发 Basic Auth 弹窗，好过打不开）。
+    window.open(sessionHref(r.id) || r.jump_url, '_blank', 'noopener,noreferrer')
   } catch (e) {
     if (e instanceof UnauthorizedError) return
-    if (e instanceof ApiError && e.code === DEVICE_AUTH_FAILED) {
-      openAuth(pctype, pcname, device.value?.public_url ?? '', () => createSession(directory))
-      return
-    }
     nsError.value = e instanceof Error ? e.message : String(e)
   } finally {
     creating.value = false

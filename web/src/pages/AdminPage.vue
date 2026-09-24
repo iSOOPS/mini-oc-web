@@ -30,18 +30,6 @@
             </button>
           </div>
         </div>
-        <div class="card secret-card">
-          <span class="info-label">云服务密钥</span>
-          <div class="key-row">
-            <code class="key-text">{{ secretRevealed.rathole ? admin.info.rathole_key : mask(admin.info.rathole_key) }}</code>
-            <button class="ghost small-btn" @click="toggleSecret('rathole')">
-              {{ secretRevealed.rathole ? '隐藏' : '显示' }}
-            </button>
-            <button class="ghost small-btn" @click="copyKey(admin.info.rathole_key, 'rathole')">
-              {{ copied === 'rathole' ? '已复制' : '复制' }}
-            </button>
-          </div>
-        </div>
       </div>
     </section>
 
@@ -106,19 +94,21 @@
       <div class="card dialog">
         <h3>{{ dialogMode === 'create' ? '新建用户' : '编辑用户' }}</h3>
         <form @submit.prevent="submitForm">
-          <label>
-            <span class="lbl">名称</span>
-            <input
-              v-model.trim="formName"
-              type="text"
-              placeholder="如 alice"
-              maxlength="64"
-              autofocus
-            />
-          </label>
+          <section class="form-card">
+            <span class="form-card-title">名称</span>
+            <label>
+              <input
+                v-model.trim="formName"
+                type="text"
+                placeholder="如 alice"
+                maxlength="64"
+                autofocus
+              />
+            </label>
+          </section>
           <!-- SB存储配置分配（域名/账号/密码，随用户存储到远程注册表） -->
-          <div class="sb-field">
-            <span class="lbl">SB存储配置分配</span>
+          <section class="form-card">
+            <span class="form-card-title">SB存储配置分配</span>
             <label>
               <span class="lbl sub">域名</span>
               <input
@@ -166,12 +156,12 @@
               </div>
             </label>
             <span class="muted helper">
-              分配给该用户的 SB 存储配置（域名默认 https://md.isoops.com）；用户登录后可在用户设置中查看并按需修改。
+              分配给该用户的 SB 存储配置（域名默认 https://md.isoops.com）；用户登录后可在设置中查看并按需修改。
             </span>
-          </div>
+          </section>
 
-          <div class="devices-field">
-            <span class="lbl">设备清单</span>
+          <section class="form-card">
+            <span class="form-card-title">设备清单</span>
             <div class="device-rows">
               <div v-for="(d, i) in formDevices" :key="i" class="device-row">
                 <label>
@@ -200,14 +190,40 @@
                   </select>
                 </label>
                 <label>
-                  <span class="lbl sub">端口号</span>
+                  <span class="lbl sub">服务端口号</span>
                   <input
                     v-model.number="d.port"
                     type="number"
-                    placeholder="如 4040"
+                    placeholder="本地 TUI 服务端口，如 9465"
                     min="1"
                     max="65535"
                   />
+                </label>
+                <label>
+                  <span class="lbl sub">OpenCode 端口号</span>
+                  <input
+                    v-model.number="d.ocPort"
+                    type="number"
+                    placeholder="TUI 启动 oc server 的端口，如 9464"
+                    min="1"
+                    max="65535"
+                  />
+                </label>
+                <label class="public-url-field">
+                  <span class="lbl sub">设备穿透地址</span>
+                  <div class="tunnel-row">
+                    <select v-model="d.publicScheme" class="scheme-select" aria-label="协议">
+                      <option value="http">http</option>
+                      <option value="https">https</option>
+                    </select>
+                    <input
+                      v-model.trim="d.publicHost"
+                      type="text"
+                      placeholder="IP 或域名（不含端口）"
+                      maxlength="200"
+                      autocomplete="off"
+                    />
+                  </div>
                 </label>
                 <label>
                   <span class="lbl sub">设备名称与绑定状态</span>
@@ -242,9 +258,9 @@
               + 添加设备
             </button>
             <span class="muted helper">
-              每台设备包含：描述（展示用，1-64 字符）、服务名称（仅限小写字母、数字、连字符，不可重复）、平台类型（windows/macos）、端口号（1-65535）、设备名称（只读）与绑定状态（均由客户端绑定时自动写入/更新，不可人工修改）；「复制」会克隆一份当前设备配置，保存时服务名称不可与其他设备重复。
+              每台设备包含：描述（展示用，1-64 字符）、服务名称（仅限小写字母、数字、连字符，不可重复）、平台类型（windows/macos）、服务端口号（本地 TUI 服务端口，1-65535）、OpenCode 端口号（TUI 启动 oc server 的端口，须与服务端口号不同）、设备穿透地址（IP 或域名 + http/https，不含端口：BFF 以 穿透地址+服务端口号 探活/调 TUI 接口，以 穿透地址+OpenCode 端口号 跳转 oc web）、设备名称（只读）与绑定状态（均由客户端绑定时自动写入/更新，不可人工修改）；「复制」会克隆一份当前设备配置，保存时服务名称不可与其他设备重复。
             </span>
-          </div>
+          </section>
           <p v-if="formError" class="error">{{ formError }}</p>
           <div class="row dialog-actions">
             <button type="button" class="ghost" @click="closeForm">取消</button>
@@ -322,14 +338,13 @@ const infoTiles = computed<{ label: string; value: string }[]>(() => {
     { label: 'SB 用户', value: i.sb_user || '—' },
     { label: '运行时长', value: fmtUptime(i.uptime_secs) },
     { label: '用户数', value: String(i.user_count) },
-    { label: '设备数', value: String(i.device_count) },
   ]
 })
 
-// --- 敏感密钥显示（SB 密码 / 云服务密钥）：默认同长度 *，点击显示 ---
-const secretRevealed = ref<{ sb: boolean; rathole: boolean }>({ sb: false, rathole: false })
+// --- 敏感密钥显示（SB 密码）：默认同长度 *，点击显示 ---
+const secretRevealed = ref<{ sb: boolean }>({ sb: false })
 
-function toggleSecret(k: 'sb' | 'rathole') {
+function toggleSecret(k: 'sb') {
   secretRevealed.value = { ...secretRevealed.value, [k]: !secretRevealed.value[k] }
 }
 
@@ -385,13 +400,18 @@ const formName = ref('')
 const formError = ref('')
 const submitting = ref(false)
 
-/** 表单内一行设备的草稿状态：port 为 '' 表示尚未输入；
- *  deviceName（设备名称）只读，由绑定客户端写入，提交时原样透传。 */
+/** 表单内一行设备的草稿状态：port / ocPort 为 '' 表示尚未输入；
+ *  deviceName（设备名称）只读，由绑定客户端写入，提交时原样透传；
+ *  publicScheme + publicHost 组成设备穿透地址（提交时拼为
+ *  scheme://host，不含端口——端口由 port / ocPort 字段承载）。 */
 interface FormDevice {
   desc: string
   name: string
   port: number | ''
+  ocPort: number | ''
   pctype: string
+  publicScheme: string
+  publicHost: string
   deviceName: string
   bound: boolean
 }
@@ -407,7 +427,17 @@ const formSbPass = ref('')
 const sbPassVisible = ref(false)
 
 function emptyDeviceRow(): FormDevice {
-  return { desc: '', name: '', port: '', pctype: 'windows', deviceName: '', bound: false }
+  return {
+    desc: '',
+    name: '',
+    port: '',
+    ocPort: 9464,
+    pctype: 'windows',
+    publicScheme: 'https',
+    publicHost: '',
+    deviceName: '',
+    bound: false,
+  }
 }
 
 function addDeviceRow() {
@@ -430,6 +460,8 @@ function duplicateDeviceRow(i: number) {
 const NAME_RE = /^[A-Za-z0-9_-]{1,64}$/
 /** 设备服务名称：全小写英文/数字/连字符，禁止其他特殊符号。 */
 const DEVICE_NAME_RE = /^[a-z0-9-]{1,64}$/
+/** 设备穿透地址主机部分：IP（v4）或域名，不含协议与端口。 */
+const PUBLIC_HOST_RE = /^(\d{1,3}(\.\d{1,3}){3}|[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*)$/
 
 /** 设备清单展示：`办公 Mac（dev-a:4040）`。描述为空时退回服务名。 */
 function fmtDevices(u: PortalUser): string {
@@ -444,9 +476,11 @@ function toUserDevices(): UserDevice[] {
       desc: d.desc,
       name: d.name,
       port: Number(d.port),
+      'oc-port': Number(d.ocPort),
       'device-name': d.deviceName,
       pctype: d.pctype,
       bound: d.bound,
+      'public-url': `${d.publicScheme}://${d.publicHost}`,
     }))
 }
 
@@ -475,7 +509,17 @@ function validate(): string {
     }
     const portNum = Number(d.port)
     if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) {
-      return `第 ${i + 1} 行（${d.desc}）的端口必须是 1-65535 的整数。`
+      return `第 ${i + 1} 行（${d.desc}）的服务端口号必须是 1-65535 的整数。`
+    }
+    const ocPortNum = Number(d.ocPort)
+    if (!Number.isInteger(ocPortNum) || ocPortNum < 1 || ocPortNum > 65535) {
+      return `第 ${i + 1} 行（${d.desc}）的 OpenCode 端口号必须是 1-65535 的整数。`
+    }
+    if (ocPortNum === portNum) {
+      return `第 ${i + 1} 行（${d.desc}）的 OpenCode 端口号须与服务端口号不同（设备端 TUI 拒绝相同端口）。`
+    }
+    if (!PUBLIC_HOST_RE.test(d.publicHost)) {
+      return `第 ${i + 1} 行（${d.desc}）的设备穿透地址「${d.publicHost}」不合法：仅限 IP 或域名，不含端口与路径。`
     }
     const prev = seen.get(d.name)
     if (prev !== undefined) {
@@ -505,17 +549,31 @@ function openCreate() {
   dialogMode.value = 'create'
 }
 
+/** 把存储的 public-url（scheme://host，后端迁移已剥端口）拆成表单的
+ * scheme + host；带端口的旧值在此再剥一次以防迁移未跑。 */
+function splitPublicUrl(url: string): { scheme: string; host: string } {
+  const m = /^(https?):\/\/([^/:?#]+)/.exec(url.trim())
+  if (!m) return { scheme: 'https', host: '' }
+  return { scheme: m[1], host: m[2] }
+}
+
 function openEdit(u: PortalUser) {
   editingUser.value = u
   formName.value = u.name
-  formDevices.value = u.devices.map((d) => ({
-    desc: d.desc ?? '',
-    name: d.name,
-    port: d.port,
-    pctype: d.pctype || 'windows',
-    deviceName: d['device-name'] ?? '',
-    bound: d.bound ?? false,
-  }))
+  formDevices.value = u.devices.map((d) => {
+    const { scheme, host } = splitPublicUrl(d['public-url'] ?? '')
+    return {
+      desc: d.desc ?? '',
+      name: d.name,
+      port: d.port,
+      ocPort: d['oc-port'] ?? 9464,
+      pctype: d.pctype || 'windows',
+      publicScheme: scheme,
+      publicHost: host,
+      deviceName: d['device-name'] ?? '',
+      bound: d.bound ?? false,
+    }
+  })
   if (formDevices.value.length === 0) formDevices.value = [emptyDeviceRow()]
   formSbUrl.value = u.sb?.base_url || DEFAULT_SB_URL
   formSbUser.value = u.sb?.username ?? ''
@@ -807,34 +865,46 @@ section + section .section-title {
   width: auto;
 }
 
-/* 设备清单行编辑器：每台设备一个块，字段竖排（设备名称/服务名称/端口各一行），
-   底部为操作行（复制/删除）；设备之间用横线分隔。 */
-.devices-field {
+/* 表单分组卡片：浅色底 + 边框，包裹 名称 / SB存储配置分配 / 设备清单 */
+.form-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px;
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  border-top: 1px solid var(--border);
-  padding-top: 12px;
+  gap: 10px;
 }
+.form-card-title {
+  font-size: 0.9rem;
+  font-weight: 700;
+  color: var(--text);
+}
+.form-card label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.form-card .lbl.sub {
+  font-size: 0.78rem;
+  font-weight: 500;
+}
+
+/* 设备清单行编辑器：每台设备一个浅色卡片，字段竖排，
+   底部为操作行（复制/删除）。 */
 .device-rows {
   display: flex;
   flex-direction: column;
+  gap: 10px;
 }
 .device-row {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  padding: 12px 0;
-}
-/* 每台设备之间用横线分隔 */
-.device-row + .device-row {
-  border-top: 1px solid var(--border);
-}
-.device-row:first-child {
-  padding-top: 0;
-}
-.device-row:last-child {
-  padding-bottom: 0;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
 }
 .device-row .lbl.sub {
   font-size: 0.78rem;
@@ -883,6 +953,15 @@ section + section .section-title {
   flex: 1;
   min-width: 0;
 }
+/* 设备穿透地址：协议下拉与主机输入分行堆叠、各自全宽 —— 移动端一行
+   放不下两个控件，且与表单其余字段（服务名称/端口号等）的竖排全宽
+   风格保持一致。 */
+.tunnel-row {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+}
 /* 绑定状态药丸：纯展示（无 hover/cursor），配色与 DevicesPage 卡片徽章同语义 */
 .bound-pill {
   flex: none;
@@ -916,23 +995,6 @@ section + section .section-title {
 }
 .add-row {
   align-self: flex-start;
-}
-/* SB存储配置分配（域名/账号/密码） */
-.sb-field {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  border-top: 1px solid var(--border);
-  padding-top: 12px;
-}
-.sb-field label {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-.sb-field .lbl.sub {
-  font-size: 0.78rem;
-  font-weight: 500;
 }
 
 /* 操作行：复制（左）+ 删除（右），与 input 同高（44px） */

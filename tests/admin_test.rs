@@ -129,10 +129,6 @@ async fn admin_info_reports_server_basics() {
         "sb_password is exposed to the admin console"
     );
     assert!(
-        body["rathole_key"].as_str().is_some_and(|s| !s.is_empty()),
-        "rathole_key is exposed to the admin console"
-    );
-    assert!(
         body["local_ips"].as_array().is_some(),
         "local_ips must be an array"
     );
@@ -255,7 +251,7 @@ async fn admin_create_user_id_is_6_digits_and_unique_in_registry() {
             "/api/admin/users",
             &serde_json::json!({
                 "name": "alice",
-                "devices": [{"desc": "Alice 的 Mac", "name": "alice-mac", "port": 9464, "pctype": "macos"}],
+                "devices": [{"desc": "Alice 的 Mac", "name": "alice-mac", "port": 9465, "oc-port": 9464, "pctype": "macos", "public-url": "https://oc-alice.example.com"}],
             }),
             Some(&cookie),
         ),
@@ -370,7 +366,7 @@ async fn admin_list_update_regenerate_delete_flow() {
             &format!("/api/admin/users/{}", TEST_USER_ID),
             &serde_json::json!({
                 "name": "renamed",
-                "devices": [{"desc": "一号机", "name": "dev-one", "port": 8200, "pctype": "windows"}],
+                "devices": [{"desc": "一号机", "name": "dev-one", "port": 8200, "pctype": "windows", "public-url": "https://dev-one.example.com"}],
                 "sb": {
                     "base_url": "https://md.isoops.com",
                     "username": "renamed-user",
@@ -401,7 +397,7 @@ async fn admin_list_update_regenerate_delete_flow() {
             &format!("/api/admin/users/{}", TEST_USER_ID),
             &serde_json::json!({
                 "name": "renamed",
-                "devices": [{"desc": "一号机", "name": "dev-one", "port": 8200, "pctype": "windows"}],
+                "devices": [{"desc": "一号机", "name": "dev-one", "port": 8200, "pctype": "windows", "public-url": "https://dev-one.example.com"}],
             }),
             Some(&cookie),
         ),
@@ -476,7 +472,7 @@ async fn admin_update_unknown_user_returns_404() {
         json_req(
             Method::PUT,
             "/api/admin/users/00000000-0000-4000-8000-000000000000",
-            &serde_json::json!({"name": "x", "devices": [{"desc": "设备甲", "name": "a", "port": 1, "pctype": "windows"}]}),
+            &serde_json::json!({"name": "x", "devices": [{"desc": "设备甲", "name": "a", "port": 1, "pctype": "windows", "public-url": "https://a.example.com"}]}),
             Some(&cookie),
         ),
     )

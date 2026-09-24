@@ -10,9 +10,6 @@ export class UnauthorizedError extends Error {
   }
 }
 
-/** BFF 会话有效，但设备端拒绝了 BFF 持有的凭据（code=device_auth_failed）。 */
-export const DEVICE_AUTH_FAILED = 'device_auth_failed'
-
 /** 带 BFF 错误码的 API 错误（对应后端 AppError 序列化的 error.code）。 */
 export class ApiError extends Error {
   code: string
@@ -43,8 +40,10 @@ async function handle<T>(r: Response): Promise<T> {
   return r.json()
 }
 
+// no-store：BFF 的 GET 响应无 Cache-Control 头，浏览器启发式缓存会让
+// /jump 等含凭据的响应陈旧化（失效 token → opencode 弹 Basic Auth 框）。
 export const apiGet = <T>(path: string, init?: RequestInit): Promise<T> =>
-  fetch(path, { credentials: 'include', ...init }).then((r) => handle<T>(r))
+  fetch(path, { credentials: 'include', cache: 'no-store', ...init }).then((r) => handle<T>(r))
 
 export const apiPost = <T>(path: string, body: unknown): Promise<T> =>
   fetch(path, {
@@ -67,16 +66,6 @@ export const apiDelete = <T>(path: string): Promise<T> =>
 
 // --- typed domain objects matching BFF routes.rs ---
 
-export interface DeviceView {
-  pctype: 'macos' | 'windows'
-  pcname: string
-  pcname_b64: string
-  portal_base: string
-  public_url: string
-  online: boolean
-  version: string | null
-}
-
 export interface ProjectInfo {
   path: string
   lastOpenedAt?: string
@@ -94,22 +83,45 @@ export interface CreatedSession {
   jump_url: string
 }
 
-/** 设备清单条目：描述 + 服务名称 + 端口 + 设备名称（客户端绑定写入）+ 平台类型 + 绑定状态。 */
+/** 设备清单条目：描述 + 服务名称 + 端口 + 设备名称（客户端绑定写入）+ 平台类型 + 绑定状态 + 设备 URL（admin 录入）。 */
 export interface UserDevice {
   /** 描述（人类可读，展示用；管理表单必填 1-64 字符；旧数据 d-name 已由服务端迁移为 desc）。 */
   desc: string
   /** 设备服务名称（路径/URL 材料）。 */
   name: string
   port: number
+  /** OpenCode 端口号：TUI 启动 oc server 的端口（默认 9464；跳转 oc web 用）。 */
+  'oc-port'?: number
   /** 设备名称 —— 仅由绑定客户端（POST /api/device-bind）写入；管理表单只读展示，空 = 尚未绑定。 */
   'device-name': string
   /** 平台类型：'windows' | 'macos'（与 SB 路径列表平台类型同枚举）。 */
   pctype: string
   /** 绑定状态（默认 false）。 */
   bound?: boolean
-  // 新增（PR 2026-09-14）：/api/me 返运行时状态；其他接口不返，字段为可选
-  /** 是否在线（BFF /api/me 内部探测结果）。 */
+  /**
+   * 设备可达 URL，admin 在分配时录入（HTTP/HTTPS）。后端用其探测
+   * `<public-url>/status`，SPA 用其构建 deep-link。为空（旧数据）时
+   * 后端不探测，报 online=false + reason"未配置"。
+   */
+  'public-url'?: string
+  // /api/me 返运行时状态；其他接口不返，字段为可选
+  /**
+   * 是否在线：设备 /status 接口能正常返回且应答平台与条目 pctype
+   * 一致时为 true。多个条目可能解析到同一探测 URL，此时其他设备
+   * 的应答会被判为不在线（reason 说明平台不匹配），避免一台设备
+   * 启动后所有绑定条目都显示可用。
+   */
   online?: boolean
+  /** opencode 是否在线：设备 /status 接口返回的 opencode_serve 字段为 "running"。 */
+  opencode_online?: boolean
+  /**
+   * 可用状态：-1 / 0 / 1，由后端根据 (bound, online, opencode_online) 计算：
+   *  1 = 完全可用（bound && online && opencode_online）
+   *  0 = 已连接但未完全可用（online=true 但 bound 或 opencode_online 缺失）
+   * -1 = 不可用（/status 探测失败）
+   * 前端按 -1/0/1 → 红/橙/绿 显示。
+   */
+  available?: number
   /** 探测失败原因（online=false 时填）。 */
   reason?: string
   /** 设备端 /status 响应体（online=true 时填）。 */
@@ -127,7 +139,6 @@ export interface SbConfig {
 export interface MeResponse {
   id: string
   name: string
-  cloud_ip: string
   last_used_at?: string
   devices: UserDevice[]
   sb: SbConfig
@@ -147,6 +158,21 @@ export interface DeviceStatus {
   online: boolean
   reason?: string
   status?: DeviceStatusInfo
+}
+
+/**
+ * GET /api/devices/:pctype/:pcname/detail — 设备连接详情，含设备端
+ * opencode serve 的 Basic 凭据。SessionsPage 预取它为降级跳转链接拼
+ * `?auth_token=`（编码对齐 BFF jump.rs），避免触发浏览器原生弹窗。
+ */
+export interface DeviceDetail {
+  pctype: string
+  pcname: string
+  public_url: string
+  port?: number
+  oc_port?: number
+  username: string
+  password: string
 }
 
 /** 管理员接口返回的租户用户（含完整 key，仅 /admin 使用）。 */
@@ -176,10 +202,8 @@ export interface AdminInfo {
   sb_base_url: string
   sb_user: string
   sb_password: string
-  rathole_key: string
   hostname: string
   local_ips: string[]
   uptime_secs: number
   user_count: number
-  device_count: number
 }

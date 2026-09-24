@@ -11,7 +11,8 @@ cd mini-oc-web
 
 # Copy environment configuration
 cp .env.example .env
-# Edit .env: set OPENCODE_SERVER_PASSWORD + SB_PASSWORD + SB_BASE_URL
+# Edit .env: set SB_PASSWORD + SB_BASE_URL (device-hop credentials are the
+# portal user's own id + login key — no OPENCODE_SERVER_* vars needed)
 
 # Build SPA (one-time, OR rely on Docker multi-stage build)
 cd web && npm install && npm run build && cd ..

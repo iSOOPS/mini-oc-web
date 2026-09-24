@@ -14,7 +14,7 @@
             <dd>{{ detail.pctype }}</dd>
           </div>
           <div class="field">
-            <dt>地址</dt>
+            <dt>穿透地址</dt>
             <dd class="break">{{ detail.public_url }}</dd>
           </div>
           <div class="field">
@@ -33,6 +33,14 @@
             </dd>
             <dd v-else class="muted-dd">（未配置）</dd>
           </div>
+          <div class="field">
+            <dt>服务端口号</dt>
+            <dd>{{ detail.port }}</dd>
+          </div>
+          <div class="field">
+            <dt>OpenCode 端口号</dt>
+            <dd>{{ detail.oc_port }}</dd>
+          </div>
         </dl>
         <p class="muted hint">密码默认隐藏为等长 * 号，点击可显示 / 隐藏原文。</p>
       </template>
@@ -47,16 +55,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { apiGet, UnauthorizedError } from '../api'
-
-export interface DeviceDetail {
-  pctype: string
-  pcname: string
-  public_url: string
-  oc_serve_port?: number
-  version?: string | null
-  username: string
-  password: string
-}
+import type { DeviceDetail } from '../api'
 
 const props = defineProps<{
   visible: boolean

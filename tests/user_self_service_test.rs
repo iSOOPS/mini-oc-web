@@ -9,8 +9,10 @@ use serial_test::serial;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-/// A registry document with explicit cloud_ip + a device on `port`.
-fn users_json_with(ip: &str, port: u16) -> String {
+/// A registry document with explicit cloud_ip + a device on `port`,
+/// optionally carrying an admin-assigned tunnel address (any port in
+/// `public_url` is stripped — ports live in the port/oc-port fields).
+fn users_json_with(ip: &str, port: u16, public_url: &str) -> String {
     serde_json::json!({
         "version": 1,
         "users": [{
@@ -18,7 +20,7 @@ fn users_json_with(ip: &str, port: u16) -> String {
             "name": TEST_USER,
             "key": TEST_KEY,
             "cloud_ip": ip,
-            "devices": [{"name": "dev-x", "port": port}],
+            "devices": [{"name": "dev-x", "port": port, "public-url": host_of(public_url)}],
         }]
     })
     .to_string()
@@ -63,7 +65,7 @@ async fn login_stamps_last_used_at_into_registry() {
 
 #[tokio::test]
 #[serial]
-async fn me_reports_cloud_ip_and_last_used_at() {
+async fn me_reports_last_used_at() {
     let sb = MockServer::start().await;
     sb_get(
         &sb,
@@ -89,7 +91,10 @@ async fn me_reports_cloud_ip_and_last_used_at() {
     let resp = send(&app, authed_get("/api/me", &cookie)).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await;
-    assert_eq!(body["cloud_ip"], "127.0.0.1");
+    // cloud_ip is intentionally absent from /api/me now: it is a
+    // device→cloud callback address (served via /api/user/info), not a
+    // portal-facing field, and the settings-page editor is gone.
+    assert!(body.get("cloud_ip").is_none(), "cloud_ip must not leak into /api/me");
     assert_eq!(body["last_used_at"], "2026-09-13T08:00:00+08:00");
 }
 
@@ -153,48 +158,6 @@ async fn me_rename_updates_and_stays_logged_in() {
 
 #[tokio::test]
 #[serial]
-async fn me_cloud_ip_updates_with_validation() {
-    let sb = MockServer::start().await;
-    sb_put_204(&sb, users_fs_path()).await;
-    let app = test_app(build_state(&sb.uri()));
-    let cookie = login(&app, &sb).await;
-
-    for good in ["9.9.9.9", "cloud.example.com", "2001:db8::1"] {
-        let resp = send(
-            &app,
-            json_req(
-                Method::POST,
-                "/api/me/cloud-ip",
-                &serde_json::json!({"ip": good}),
-                Some(&cookie),
-            ),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK, "ip {good} must be accepted");
-    }
-
-    let long = "a".repeat(200);
-    for bad in ["", "not a ip!", "http://evil/x", long.as_str()] {
-        let resp = send(
-            &app,
-            json_req(
-                Method::POST,
-                "/api/me/cloud-ip",
-                &serde_json::json!({"ip": bad}),
-                Some(&cookie),
-            ),
-        )
-        .await;
-        assert_eq!(
-            resp.status(),
-            StatusCode::BAD_REQUEST,
-            "ip {bad:?} must be rejected"
-        );
-    }
-}
-
-#[tokio::test]
-#[serial]
 async fn device_status_probes_cloud_endpoint() {
     let device = MockServer::start().await;
     let port = device.uri().split(':').next_back().unwrap().parse::<u16>().unwrap();
@@ -215,7 +178,13 @@ async fn device_status_probes_cloud_endpoint() {
         .await;
 
     let sb = MockServer::start().await;
-    sb_get(&sb, users_fs_path(), 200, &users_json_with("127.0.0.1", port)).await;
+    sb_get(
+        &sb,
+        users_fs_path(),
+        200,
+        &users_json_with("127.0.0.1", port, &device.uri()),
+    )
+    .await;
     let app = test_app(build_state(&sb.uri()));
     let cookie = login(&app, &sb).await;
 
@@ -243,11 +212,46 @@ async fn device_status_probes_cloud_endpoint() {
 
 #[tokio::test]
 #[serial]
-async fn device_status_reports_offline_for_unreachable_port() {
-    // Bind nothing on this port — the probe must answer online:false,
-    // not 5xx (the page renders an offline card).
+async fn device_status_reports_offline_for_unreachable_url() {
+    // The device URL points at a dead port — the probe must answer
+    // online:false with a network-level reason, not 5xx.
     let sb = MockServer::start().await;
-    sb_get(&sb, users_fs_path(), 200, &users_json_with("127.0.0.1", 59999)).await;
+    sb_get(
+        &sb,
+        users_fs_path(),
+        200,
+        &users_json_with("127.0.0.1", 59999, "http://127.0.0.1:1"),
+    )
+    .await;
+    let app = test_app(build_state(&sb.uri()));
+    let cookie = login(&app, &sb).await;
+
+    let resp = send(&app, authed_get("/api/device-status/59999", &cookie)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["online"], false);
+    let reason = body["reason"].as_str().unwrap_or_default();
+    assert!(!reason.is_empty(), "offline reason must be present");
+    assert!(
+        !reason.contains("not configured"),
+        "a configured URL must be probed, got reason: {reason}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn device_status_without_url_reports_not_configured() {
+    // Legacy entry with an empty public-url: no probe attempt is made —
+    // the cloud_ip user setting is a device→cloud callback address and
+    // must never be borrowed as a probe target.
+    let sb = MockServer::start().await;
+    sb_get(
+        &sb,
+        users_fs_path(),
+        200,
+        &users_json_with("127.0.0.1", 59999, ""),
+    )
+    .await;
     let app = test_app(build_state(&sb.uri()));
     let cookie = login(&app, &sb).await;
 
@@ -256,8 +260,40 @@ async fn device_status_reports_offline_for_unreachable_port() {
     let body = body_json(resp).await;
     assert_eq!(body["online"], false);
     assert!(
-        body["reason"].as_str().is_some(),
-        "offline reason must be present"
+        body["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("not configured")),
+        "empty public-url must report 'not configured', got: {}",
+        body["reason"]
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn me_reports_not_configured_for_empty_device_url() {
+    let sb = MockServer::start().await;
+    sb_get(
+        &sb,
+        users_fs_path(),
+        200,
+        &users_json_with("127.0.0.1", 59998, ""),
+    )
+    .await;
+    let app = test_app(build_state(&sb.uri()));
+    let cookie = login(&app, &sb).await;
+
+    let resp = send(&app, authed_get("/api/me", &cookie)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let dev = &body["devices"][0];
+    assert_eq!(dev["online"], false);
+    assert_eq!(dev["available"], -1);
+    assert!(
+        dev["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("not configured")),
+        "empty public-url must surface a 'not configured' reason, got: {}",
+        dev["reason"]
     );
 }
 

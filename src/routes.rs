@@ -1,17 +1,14 @@
 use crate::auth::{sign_cookie, verify_cookie};
-use crate::devices::{
-    path_list_path, probe_device_status, validate_pcname, Device, DevicesFile, PathListEntry,
-    DEVICES_PATH,
-};
 use crate::error::{AppError, AppResult};
 use crate::jump::{
-    append_auth_token, build_jump_url, pcname_b64, resolve_base_url, validate_base_url, JumpInput,
+    append_auth_token, build_jump_url, pcname_b64,
 };
+use crate::probe::{probe_device_status, verify_device_identity, DeviceProbeResult};
 use crate::proxy::{CreatedSession, DeviceClient, ProjectInfo, SessionInfo};
 use crate::state::AppState;
 use crate::users::{
-    generate_key, generate_user_id_unique, validate_cloud_ip, validate_sb_config,
-    validate_user_devices, validate_user_name, PortalUser, UserDevice, UserSbConfig, UsersFile,
+    generate_key, generate_user_id_unique, validate_sb_config, validate_user_devices,
+    validate_user_name, PortalUser, UserDevice, UserSbConfig, UsersFile,
 };
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
@@ -20,10 +17,75 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json as AxumJson, Router};
 use futures::future::join_all;
-use serde::{Deserialize, Serialize};
+use regex::Regex;
+use serde::Deserialize;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+
+/// SB path of a user's per-device project/session registry, written by
+/// the mini-oc-gui end-side. Multi-tenant layout: `user_id` is the
+/// portal user's id (NOT the admin SB_USER); `pctype` comes from the
+/// device entry's `UserDevice.pctype`; the third segment is the device
+/// SERVICE NAME (`UserDevice.name`, same as the URL `pcname`) — verified
+/// against the live registry (`.../667004/macos/service-mac/path-list.md`),
+/// NOT the client-reported `device-name`.
+const PATH_LIST_PATH: &str = "serv/opencode/{user_id}/{pctype}/{pcname}/path-list.md";
+
+fn path_list_path(user_id: &str, pctype: &str, pcname: &str) -> String {
+    PATH_LIST_PATH
+        .replace("{user_id}", user_id)
+        .replace("{pctype}", pctype)
+        .replace("{pcname}", pcname)
+}
+
+/// One session section of `path-list.md` — live wire shape (verified
+/// against the SB document): `{"id":"ses_…","title":"…","directory":"…",
+/// "createdAt":"…","updatedAt":"…"}` (camelCase timestamps; `directory`
+/// is tolerated and ignored — the entry's `path` already identifies the
+/// project).
+#[derive(Debug, Clone, Deserialize)]
+struct PathSection {
+    id: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default, rename = "updatedAt")]
+    updated_at: Option<String>,
+}
+
+/// One entry of `path-list.md`. Wire shape mirrors the mini-oc-gui
+/// end-side (camelCase timestamps, verified against the live SB
+/// document): `{"path":"D:/x","sections":[{…PathSection…}],"createdAt":
+/// "2026-09-09T23:25:10+08:00","lastOpenedAt":"2026-09-13T00:59:41+08:00"}`.
+/// Timestamps are passed through as RFC-3339 strings.
+#[derive(Debug, Clone, Deserialize)]
+struct PathListEntry {
+    path: String,
+    #[serde(default)]
+    sections: Vec<PathSection>,
+    /// Parsed for schema completeness with the mini-oc-gui end-side
+    /// wire format, but not consumed by the BFF (project ordering comes
+    /// from `lastOpenedAt` only). Cheap to keep — deserializer tolerates
+    /// missing field.
+    #[serde(default)]
+    #[allow(dead_code)]
+    created_at: Option<String>,
+    #[serde(default, rename = "lastOpenedAt")]
+    last_opened_at: Option<String>,
+}
+
+/// Whitelist: `[A-Za-z0-9_-]{1,64}` (design doc §7.2). Validates device
+/// `pcname` segments in the URL path of every `/api/devices/:pctype/:pcname/...`
+/// route, where the pcname segment must be safe to splice into SB paths.
+fn validate_pcname(s: &str) -> AppResult<()> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"^[A-Za-z0-9_-]{1,64}$").unwrap());
+    if re.is_match(s) {
+        Ok(())
+    } else {
+        Err(AppError::InvalidPcname(s.to_string()))
+    }
+}
 
 const COOKIE_NAME: &str = "mini_oc_web_session";
 const COOKIE_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
@@ -48,18 +110,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/me", get(me))
         .route("/api/me/key", get(me_key))
         .route("/api/me/name", post(me_rename))
-        .route("/api/me/cloud-ip", post(me_cloud_ip))
         .route("/api/me/sb", post(me_sb))
         .route("/api/user/info", post(user_info_by_key))
         .route("/api/device-bind", post(device_bind))
         .route("/api/device-status/:port", get(device_status))
-        .route("/api/devices", get(devices))
-        .route("/api/devices/seed", post(devices_seed))
-        .route(
-            "/api/devices/:pctype/:pcname/auth-check",
-            get(device_auth_check),
-        )
-        .route("/api/devices/:pctype/:pcname/auth", post(device_auth))
         .route(
             "/api/devices/:pctype/:pcname/projects",
             get(device_projects),
@@ -71,10 +125,6 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/devices/:pctype/:pcname/jump",
             get(device_jump),
-        )
-        .route(
-            "/api/devices/:pctype/:pcname",
-            axum::routing::delete(device_delete),
         )
         .route(
             "/api/devices/:pctype/:pcname/detail",
@@ -235,6 +285,34 @@ fn ensure_device_allowed(user: &PortalUser, pcname: &str) -> AppResult<()> {
     }
 }
 
+/// Device-hop Basic-Auth credentials: the signed-in portal user's own
+/// account id (username) and login key (password).
+///
+/// The device-side opencode serve runs with
+/// `OPENCODE_SERVER_USERNAME=<user id>` / `OPENCODE_SERVER_PASSWORD=<user
+/// key>` (mini-oc-gui configures both from the binding profile it fetches
+/// via `POST /api/user/info`), so the BFF's server-side device calls and
+/// the browser-side `?auth_token=` deep link authenticate with the same
+/// self-derived pair — no per-device credential dialog or portal-wide
+/// fallback env pair anymore.
+fn device_credentials(user: &PortalUser) -> (String, String) {
+    (user.id.clone(), user.key.clone())
+}
+
+/// Base URL of the device's local TUI service (mini-oc-gui): the tunnel
+/// address plus the 服务端口号 — `/status`, `/project`, `/api/session`
+/// all live here. Callers must ensure `public_url` is non-empty first.
+fn tui_base_url(ud: &UserDevice) -> String {
+    format!("{}:{}", ud.public_url.trim_end_matches('/'), ud.port)
+}
+
+/// Base URL of the device's opencode server (web UI + native API): the
+/// tunnel address plus the OpenCode 端口号. Browser deep links are built
+/// on this. Callers must ensure `public_url` is non-empty first.
+fn oc_base_url(ud: &UserDevice) -> String {
+    format!("{}:{}", ud.public_url.trim_end_matches('/'), ud.oc_port)
+}
+
 async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok\n")
 }
@@ -290,8 +368,42 @@ async fn login(
 }
 
 /// Who am I: the signed-in user's portal profile (no key material) with
-/// every assigned device's runtime status probed concurrently via the
-/// user's cloud tunnel (`http://{cloud_ip}:{port}/status`).
+/// every assigned device's runtime status probed concurrently.
+///
+/// Each device is probed at the TUI-service address composed from its
+/// admin-assigned tunnel address and 服务端口号: `GET
+/// {public_url}:{port}/status` (see [`tui_base_url`]; the same URL base
+/// serves `/project` and `/api/session`). Browser deep links use the
+/// OpenCode 端口号 instead: `{public_url}:{oc_port}/...`.
+///
+/// Each device entry carries three independent runtime signals so the SPA
+/// can render them separately:
+/// - `online` (bool): whether `GET /status` answered at all (regardless of
+///   body content). `false` when the probe connect/timeout/non-2xx or the
+///   body couldn't be parsed — see `reason`. Also `false` when the answer's
+///   platform (`system.os`) disagrees with the entry's `pctype`: several
+///   entries can resolve to the same probe URL, and a /status answer
+///   from a different device must not paint this entry green — see
+///   [`crate::probe::verify_device_identity`].
+/// - `opencode_online` (bool): whether `/status`'s `opencode_serve` field
+///   is the literal `"running"`. Always `false` when `online` is `false`
+///   (no status body to inspect).
+/// - `available` (number): roll-up of (bound, online, opencode_online) for
+///   color-coding the dot:
+///   * `1` = fully usable (bound AND online AND opencode_online)
+///   * `0` = reachable but not yet usable (online=true but bound or
+///          opencode_online missing)
+///   * `-1` = unreachable (online=false — `/status` probe failed)
+///
+/// Two distinct addresses must not be conflated:
+///   * `cloud_ip` (user settings "云服务 IP") — device→cloud direction:
+///     the address the device-side TUI uses to call back this BFF
+///     (`/api/device-bind`, `/api/user/info`). Never a probe target.
+///   * `UserDevice.public_url` (admin-assigned device URL) — cloud→device
+///     direction: the ONLY address the BFF probes `<url>/status` with.
+/// Entries with an empty `public_url` (legacy data; new writes are
+/// validated non-empty) are reported offline with an explicit
+/// "not configured" reason instead of borrowing `cloud_ip`.
 async fn me(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -300,20 +412,52 @@ async fn me(
     let probes = user
         .devices
         .iter()
-        .map(|d| probe_device_status(&user.cloud_ip, d.port))
+        .map(|d| async move {
+            if d.public_url.trim().is_empty() {
+                DeviceProbeResult::offline(
+                    "device URL not configured (empty public-url) — \
+                     ask the admin to fill the device URL in the user's device list",
+                )
+            } else {
+                probe_device_status(tui_base_url(d)).await
+            }
+        })
         .collect::<Vec<_>>();
     let results = join_all(probes).await;
 
     let mut enriched: Vec<serde_json::Value> = Vec::with_capacity(user.devices.len());
     for (ud, pr) in user.devices.iter().zip(results.into_iter()) {
+        // Reject /status answers that come from a different device
+        // (entries sharing one probe URL) — see verify_device_identity.
+        let pr = verify_device_identity(&ud.pctype, pr);
+        let opencode_online = pr.online
+            && pr
+                .status
+                .as_ref()
+                .and_then(|s| s.get("opencode_serve"))
+                .and_then(|v| v.as_str())
+                == Some("running");
+
+        let available: i8 = if !pr.online {
+            -1
+        } else if ud.bound && opencode_online {
+            1
+        } else {
+            0
+        };
+
         let mut entry = serde_json::json!({
             "desc": ud.desc,
             "name": ud.name,
             "port": ud.port,
+            "oc-port": ud.oc_port,
             "device-name": ud.device_name,
             "pctype": ud.pctype,
             "bound": ud.bound,
+            "public-url": ud.public_url,
             "online": pr.online,
+            "opencode_online": opencode_online,
+            "available": available,
         });
         if let Some(r) = pr.reason {
             entry["reason"] = serde_json::Value::String(r);
@@ -327,7 +471,6 @@ async fn me(
     Ok(AxumJson(serde_json::json!({
         "id": user.id,
         "name": user.name,
-        "cloud_ip": user.cloud_ip,
         "last_used_at": user.last_used_at,
         "devices": enriched,
         "sb": user.sb,
@@ -373,33 +516,6 @@ async fn me_rename(
     target.updated_at = Some(chrono::Local::now().to_rfc3339());
     state.users.save(&uf).await?;
     Ok(AxumJson(serde_json::json!({"ok": true, "name": body.name})))
-}
-
-#[derive(Deserialize)]
-struct MeCloudIpBody {
-    ip: String,
-}
-
-/// Self-service cloud IP update (云服务设置). The device list itself is
-/// admin-controlled and deliberately NOT editable here.
-async fn me_cloud_ip(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    AxumJson(body): AxumJson<MeCloudIpBody>,
-) -> AppResult<AxumJson<serde_json::Value>> {
-    let user = current_user(&state, &headers).await?;
-    validate_cloud_ip(&body.ip)?;
-    let ip = body.ip.trim().to_string();
-    let mut uf = state.users.load().await?;
-    let target = uf
-        .users
-        .iter_mut()
-        .find(|u| u.id == user.id)
-        .ok_or(AppError::NotFound("user".into()))?;
-    target.cloud_ip = ip.clone();
-    target.updated_at = Some(chrono::Local::now().to_rfc3339());
-    state.users.save(&uf).await?;
-    Ok(AxumJson(serde_json::json!({"ok": true, "cloud_ip": ip})))
 }
 
 #[derive(Deserialize)]
@@ -547,46 +663,39 @@ async fn device_bind(
     })))
 }
 
-/// Probe a device's real state through the user's cloud tunnel:
-/// `GET http://{cloud_ip}:{port}/status` on the mini-oc-gui end side
-/// (unauthenticated snapshot: opencode_serve / rathole / system info).
-/// The device has no CORS layer, so the BFF proxies the request
-/// server-side; the port must belong to the caller's device list.
+/// Probe a device's real state through its own `public_url` (admin-
+/// assigned in `UserDevice.public_url` — cloud→device direction; see
+/// [`me`] for the address-semantics rationale). An empty `public_url`
+/// yields an offline result with a "not configured" reason — the
+/// `cloud_ip` user setting (device→cloud callback address) is never a
+/// probe target.
 async fn device_status(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(port): Path<u16>,
 ) -> AppResult<AxumJson<serde_json::Value>> {
     let user = current_user(&state, &headers).await?;
-    if !user.devices.iter().any(|d| d.port == port) {
-        return Err(AppError::Forbidden(format!(
-            "port {port} is not in your device list"
-        )));
+    let ud = user
+        .devices
+        .iter()
+        .find(|d| d.port == port)
+        .ok_or_else(|| AppError::Forbidden(format!("port {port} is not in your device list")))?;
+    let pr = if ud.public_url.trim().is_empty() {
+        DeviceProbeResult::offline(
+            "device URL not configured (empty public-url) — \
+             ask the admin to fill the device URL in the user's device list",
+        )
+    } else {
+        verify_device_identity(&ud.pctype, probe_device_status(tui_base_url(ud)).await)
+    };
+    let mut body = serde_json::json!({"online": pr.online});
+    if let Some(r) = pr.reason {
+        body["reason"] = serde_json::Value::String(r);
     }
-    let url = format!("http://{}:{}/status", user.cloud_ip, port);
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(4))
-        .build()
-        .map_err(|e| AppError::Internal(format!("probe client: {}", e)))?;
-    match http.get(&url).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            let status: serde_json::Value = resp
-                .json()
-                .await
-                .map_err(|e| AppError::Internal(format!("status body parse: {}", e)))?;
-            Ok(AxumJson(
-                serde_json::json!({"online": true, "status": status}),
-            ))
-        }
-        Ok(resp) => Ok(AxumJson(serde_json::json!({
-            "online": false,
-            "reason": format!("device returned HTTP {}", resp.status()),
-        }))),
-        Err(e) => Ok(AxumJson(serde_json::json!({
-            "online": false,
-            "reason": e.to_string(),
-        }))),
+    if let Some(s) = pr.status {
+        body["status"] = s;
     }
+    Ok(AxumJson(body))
 }
 
 async fn logout() -> impl IntoResponse {
@@ -602,66 +711,10 @@ async fn logout() -> impl IntoResponse {
     (StatusCode::OK, headers, AxumJson(serde_json::json!({"ok": true})))
 }
 
-#[derive(Serialize)]
-struct DeviceView {
-    pctype: String,
-    pcname: String,
-    /// URL-safe base64 of `pcname`. The first URL segment on the portal host,
-    /// e.g. `oc.isoops.com/c2FtdWVs/...`.
-    pcname_b64: String,
-    /// The portal host (`oc.isoops.com`) — what the SPA / devices page uses
-    /// to build `<a href>` jump URLs.
-    portal_base: String,
-    /// Devices.json's `public_url`. Used for the BFF-to-device API hop and
-    /// as the jump base URL.
-    public_url: String,
-    online: bool,
-    version: Option<String>,
-}
-
-/// Devices visible to the signed-in user: `devices.json` entries filtered
-/// by the user's assigned device names (multi-tenant isolation).
-async fn devices(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> AppResult<AxumJson<Vec<DeviceView>>> {
-    let user = current_user(&state, &headers).await?;
-    let df: DevicesFile = state.devices.load().await?;
-
-    let portal_base = state.config.portal_base.clone();
-    let mut out = Vec::new();
-    for d in df.devices {
-        if !user.devices.iter().any(|ud| ud.name == d.pcname) {
-            continue;
-        }
-        // Health probing is credential-free by design (ADR #13): pass empty
-        // strings instead of placeholder credentials.
-        let client = DeviceClient::new(&d.public_url, "", "");
-        let online = client.health().await.unwrap_or(false);
-        out.push(DeviceView {
-            portal_base: portal_base.clone(),
-            pcname_b64: pcname_b64(&d.pcname),
-            public_url: d.public_url.clone(),
-            pctype: d.pctype.clone(),
-            pcname: d.pcname.clone(),
-            online,
-            version: d.version,
-        });
-    }
-    Ok(AxumJson(out))
-}
-
-#[derive(Deserialize)]
-struct SeedBody {
-    pctype: String,
-    pcname: String,
-    public_url: String,
-}
-
 /// Device connection details for the SPA "详情" dialog: identity, base
-/// URL, and the credentials the BFF would use for the device hop
-/// (cached user-supplied pair first, unified config pair as fallback).
-/// The password is returned in clear text — the SPA masks it client-side
+/// URL, and the credentials the BFF uses for the device hop — the signed-in
+/// user's own account id + login key (see [`device_credentials`]). The
+/// password is returned in clear text — the SPA masks it client-side
 /// (`*` per char) until the user reveals it. Session-protected like
 /// every other /api route.
 async fn device_detail(
@@ -670,191 +723,37 @@ async fn device_detail(
     Path((pctype, pcname)): Path<(String, String)>,
 ) -> AppResult<AxumJson<serde_json::Value>> {
     let user = current_user(&state, &headers).await?;
-    let (_, _) = parse_device_path(&pctype, &pcname)?;
+    if pctype != "macos" && pctype != "windows" {
+        return Err(AppError::InvalidTarget(format!("bad pctype: {}", pctype)));
+    }
+    validate_pcname(&pcname)?;
     ensure_device_allowed(&user, &pcname)?;
-    let df = state.devices.load().await?;
-    let device = find_device(&df, &pctype, &pcname)?;
-    let (username, password) = device_creds_for(&state, device);
+    let ud = user
+        .devices
+        .iter()
+        .find(|d| d.name == pcname)
+        .ok_or_else(|| AppError::NotFound("device".into()))?;
+    let (username, password) = device_credentials(&user);
     Ok(AxumJson(serde_json::json!({
-        "pctype": device.pctype,
-        "pcname": device.pcname,
-        "public_url": device.public_url,
-        "oc_serve_port": device.oc_serve_port,
-        "version": device.version,
+        "pctype": ud.pctype,
+        "pcname": ud.name,
+        "public_url": ud.public_url,
+        "port": ud.port,
+        "oc_port": ud.oc_port,
         "username": username,
         "password": password,
     })))
 }
 
-/// Remove a device from `devices.json` (read-modify-write). Used by the
-/// SPA for manually-added (seeded) device cards; end-side registered
-/// devices manage their own lifecycle.
-async fn device_delete(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path((pctype, pcname)): Path<(String, String)>,
-) -> AppResult<AxumJson<serde_json::Value>> {
-    let user = current_user(&state, &headers).await?;
-    let (pctype, pcname) = parse_device_path(&pctype, &pcname)?;
-    ensure_device_allowed(&user, &pcname)?;
-    let mut df = state.devices.load().await?;
-    let key = format!("{}/{}", pctype, pcname);
-    let before = df.devices.len();
-    df.devices.retain(|d| d.key() != key);
-    if df.devices.len() == before {
-        return Err(AppError::NotFound("device".into()));
-    }
-    let path = DEVICES_PATH.replace("{user}", &state.config.sb_user);
-    let json = serde_json::to_string_pretty(&df)
-        .map_err(|e| AppError::Internal(format!("devices serialize: {}", e)))?;
-    state.sb.put_fs(&path, &json).await?;
-    Ok(AxumJson(serde_json::json!({ "ok": true })))
-}
-
-/// Register a demo device into `devices.json` without a live end-side
-/// (mini-oc-gui) reporter (spec §3.2). Local-dev helper: kept for offline
-/// demos after the end-side registration ships, not recommended in
-/// production. Replaces any existing entry with the same pctype/pcname.
-async fn devices_seed(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    AxumJson(body): AxumJson<SeedBody>,
-) -> AppResult<AxumJson<serde_json::Value>> {
-    let user = current_user(&state, &headers).await?;
-    let (pctype, pcname) = parse_device_path(&body.pctype, &body.pcname)?;
-    // Multi-tenant: seeding a pcname the caller may not see would produce
-    // an invisible device, so require it to be in the user's device list.
-    ensure_device_allowed(&user, &pcname)?;
-    let public_url = validate_base_url(&body.public_url)?;
-
-    // Read-modify-write devices.json: replace an existing entry with the
-    // same pctype/pcname, otherwise append (`load` returns an empty file
-    // when devices.json does not exist yet).
-    let mut df = state.devices.load().await?;
-    let key = format!("{}/{}", pctype, pcname);
-    df.devices.retain(|d| d.key() != key);
-    df.devices.push(Device {
-        pctype,
-        pcname,
-        public_url,
-        oc_serve_port: 4040,
-        reported_at: Some(chrono::Local::now().to_rfc3339()),
-        version: None,
-    });
-    let path = DEVICES_PATH.replace("{user}", &state.config.sb_user);
-    let json = serde_json::to_string_pretty(&df)
-        .map_err(|e| AppError::Internal(format!("devices serialize: {}", e)))?;
-    state.sb.put_fs(&path, &json).await?;
-    Ok(AxumJson(serde_json::json!({"ok": true})))
-}
-
-fn parse_device_path(pctype: &str, pcname: &str) -> AppResult<(String, String)> {
-    if pctype != "macos" && pctype != "windows" {
-        return Err(AppError::InvalidTarget(format!("bad pctype: {}", pctype)));
-    }
-    validate_pcname(pcname)?;
-    Ok((pctype.to_string(), pcname.to_string()))
-}
-
-/// Find a devices.json entry by (pctype, pcname). Shared by every
-/// `/api/devices/:pctype/:pcname/...` handler.
-fn find_device<'a>(
-    df: &'a DevicesFile,
-    pctype: &str,
-    pcname: &str,
-) -> AppResult<&'a Device> {
-    df.devices
-        .iter()
-        .find(|d| d.pctype == pctype && d.pcname == pcname)
-        .ok_or(AppError::NotFound("device".into()))
-}
-
-/// Build a [`DeviceClient`] with the best credentials we have for this
-/// device: user-supplied credentials cached via `POST .../auth` first,
-/// unified `OPENCODE_SERVER_USERNAME/PASSWORD` as fallback.
-fn cached_device_client(state: &AppState, device: &Device) -> DeviceClient {
-    let (user, pass) = device_creds_for(state, device);
-    DeviceClient::new(&device.public_url, &user, &pass)
-}
-
-/// Credentials for this device: cached user-supplied pair first, unified
-/// config pair as fallback. Same priority as [`cached_device_client`];
-/// used both for the proxy hop and for embedding `auth_token` into jump
-/// URLs so the browser lands on the device web UI already authorized.
-fn device_creds_for(state: &AppState, device: &Device) -> (String, String) {
-    state.device_creds.get(&device.key()).unwrap_or_else(|| {
-        (
-            state.config.device_user.clone(),
-            state.config.device_pass.clone(),
-        )
-    })
-}
-
-#[derive(Deserialize)]
-struct DeviceAuthBody {
-    username: String,
-    password: String,
-}
-
-/// Probe whether the BFF can currently talk to a device's protected API.
-///
-/// The SPA calls this when the user clicks a device card: `{required:
-/// true}` means the cached/unified credentials got a 401 from the device
-/// and the SPA should pop the credential dialog before navigating. Any
-/// other failure (device unreachable, etc.) propagates as an error so
-/// the SPA can surface it.
-async fn device_auth_check(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path((pctype, pcname)): Path<(String, String)>,
-) -> AppResult<AxumJson<serde_json::Value>> {
-    let user = current_user(&state, &headers).await?;
-    let (_, _) = parse_device_path(&pctype, &pcname)?;
-    ensure_device_allowed(&user, &pcname)?;
-    let df = state.devices.load().await?;
-    let device = find_device(&df, &pctype, &pcname)?;
-    let client = cached_device_client(&state, device);
-    match client.projects().await {
-        Ok(_) => Ok(AxumJson(serde_json::json!({ "required": false }))),
-        Err(AppError::DeviceAuthFailed(_)) => {
-            Ok(AxumJson(serde_json::json!({ "required": true })))
-        }
-        Err(e) => Err(e),
-    }
-}
-
-/// Verify user-supplied credentials against a device and cache them for
-/// the BFF's server-side device calls. A bad pair returns
-/// `device_auth_failed` (502) so the SPA can keep the dialog open and
-/// show the error; a good pair returns `{ok: true}` and the SPA proceeds
-/// to the (now authorized) device pages.
-async fn device_auth(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path((pctype, pcname)): Path<(String, String)>,
-    AxumJson(body): AxumJson<DeviceAuthBody>,
-) -> AppResult<AxumJson<serde_json::Value>> {
-    let user = current_user(&state, &headers).await?;
-    let (_, _) = parse_device_path(&pctype, &pcname)?;
-    ensure_device_allowed(&user, &pcname)?;
-    let df = state.devices.load().await?;
-    let device = find_device(&df, &pctype, &pcname)?;
-    let client = DeviceClient::new(&device.public_url, &body.username, &body.password);
-    client.projects().await?;
-    state
-        .device_creds
-        .set(&device.key(), &body.username, &body.password);
-    Ok(AxumJson(serde_json::json!({ "ok": true })))
-}
-
 /// Load the device's `path-list.md` from SilverBullet. The document is
 /// located per the multi-tenant layout
-/// `serv/opencode/{user_id}/{pctype}/{device_name}/path-list.md`:
-/// the platform type and device name come from the caller's own
-/// device-list entry (设备清单) — `pctype` assigned by the admin,
-/// `device-name` reported by the binding client — falling back to the
-/// URL's pctype / the service name for legacy entries that predate
-/// those fields. A missing document is an empty registry (the end-side
+/// `serv/opencode/{user_id}/{pctype}/{pcname}/path-list.md`: the user id
+/// is the caller's own id and the platform type comes from the caller's
+/// device-list entry (设备清单, admin-assigned; falls back to the URL's
+/// pctype for legacy entries), while the last segment is the device
+/// SERVICE NAME (`UserDevice.name` / URL pcname) — the mini-oc-gui
+/// end-side keys its registry by service name, NOT the client-reported
+/// `device-name`. A missing document is an empty registry (the end-side
 /// hasn't synced yet); only transport and parse failures surface as
 /// errors.
 async fn load_path_list(
@@ -874,12 +773,7 @@ async fn load_path_list(
     } else {
         dev.pctype.as_str()
     };
-    let device_name = if dev.device_name.is_empty() {
-        pcname
-    } else {
-        dev.device_name.as_str()
-    };
-    let path = path_list_path(&user.id, pctype, device_name);
+    let path = path_list_path(&user.id, pctype, pcname);
     match state.sb.get_fs(&path).await {
         Ok(body) => serde_json::from_str(&body)
             .map_err(|e| AppError::Internal(format!("path-list parse: {}", e))),
@@ -897,7 +791,10 @@ async fn device_projects(
     Path((pctype, pcname)): Path<(String, String)>,
 ) -> AppResult<AxumJson<Vec<ProjectInfo>>> {
     let user = current_user(&state, &headers).await?;
-    let (_, _) = parse_device_path(&pctype, &pcname)?;
+    if pctype != "macos" && pctype != "windows" {
+        return Err(AppError::InvalidTarget(format!("bad pctype: {}", pctype)));
+    }
+    validate_pcname(&pcname)?;
     ensure_device_allowed(&user, &pcname)?;
     let entries = load_path_list(&state, &user, &pctype, &pcname).await?;
     let projects = entries
@@ -924,7 +821,10 @@ async fn device_sessions(
     Query(q): Query<SessionsQuery>,
 ) -> AppResult<AxumJson<Vec<SessionInfo>>> {
     let user = current_user(&state, &headers).await?;
-    let (_, _) = parse_device_path(&pctype, &pcname)?;
+    if pctype != "macos" && pctype != "windows" {
+        return Err(AppError::InvalidTarget(format!("bad pctype: {}", pctype)));
+    }
+    validate_pcname(&pcname)?;
     ensure_device_allowed(&user, &pcname)?;
     let entries = load_path_list(&state, &user, &pctype, &pcname).await?;
     let sessions = entries
@@ -933,10 +833,10 @@ async fn device_sessions(
         .map(|e| {
             e.sections
                 .into_iter()
-                .map(|id| SessionInfo {
-                    updated_at: e.last_opened_at.clone(),
-                    title: None,
-                    id,
+                .map(|s| SessionInfo {
+                    updated_at: s.updated_at.or_else(|| e.last_opened_at.clone()),
+                    title: s.title,
+                    id: s.id,
                 })
                 .collect::<Vec<_>>()
         })
@@ -957,17 +857,22 @@ async fn device_create_session(
     AxumJson(body): AxumJson<CreateSessionBody>,
 ) -> AppResult<AxumJson<serde_json::Value>> {
     let user = current_user(&state, &headers).await?;
-    let (_, _) = parse_device_path(&pctype, &pcname)?;
-    ensure_device_allowed(&user, &pcname)?;
-    let df = state.devices.load().await?;
-    let device = find_device(&df, &pctype, &pcname)?;
-    let client = cached_device_client(&state, device);
+    if pctype != "macos" && pctype != "windows" {
+        return Err(AppError::InvalidTarget(format!("bad pctype: {}", pctype)));
+    }
+    validate_pcname(&pcname)?;
+    let ud = user
+        .devices
+        .iter()
+        .find(|d| d.name == pcname)
+        .ok_or_else(|| AppError::NotFound("device".into()))?;
+    let (user_cred, pass_cred) = device_credentials(&user);
+    let client = DeviceClient::new(&tui_base_url(ud), &user_cred, &pass_cred);
     let created: CreatedSession = client
         .create_session(&body.directory, body.title.as_deref())
         .await?;
-    let url = compute_jump_url(&state, device, &body.directory, &created.id).await?;
-    let (user, pass) = device_creds_for(&state, device);
-    let url = append_auth_token(&url, &user, &pass);
+    let url = build_jump_url_for(&state, ud, &body.directory, &created.id);
+    let url = append_auth_token(&url, &user_cred, &pass_cred);
     Ok(AxumJson(serde_json::json!({
         "id": created.id,
         "directory": created.directory,
@@ -977,33 +882,27 @@ async fn device_create_session(
 
 /// Resolve the deep-link URL for a session on a given device.
 ///
-/// Base URL priority after the config.md removal: devices.json
-/// `public_url`, falling back to `portal_base/{b64pc}` (the unified-domain
+/// Base URL priority: `UserDevice.public_url` (admin-assigned device
+/// base), falling back to `portal_base/{b64pc}` (the unified-domain
 /// path-prefix scheme) when the device has no usable URL. On a failed
 /// resolve we degrade silently rather than 5xx — the caller has no way
 /// to recover.
-async fn compute_jump_url(
+fn build_jump_url_for(
     state: &AppState,
-    device: &Device,
+    ud: &UserDevice,
     directory: &str,
     session_id: &str,
-) -> AppResult<String> {
-    let resolved = resolve_base_url(&JumpInput {
-        device_key: device.key(),
-        override_url: None,
-        default_base_url: None,
-        devices_public_url: Some(device.public_url.clone()),
-    })
-    .unwrap_or_else(|_| {
-        // Fallback to the unified-domain path-prefix URL.
+) -> String {
+    let resolved = if !ud.public_url.trim().is_empty() {
+        oc_base_url(ud)
+    } else {
         format!(
             "{}/{}",
             state.config.portal_base.trim_end_matches('/'),
-            pcname_b64(&device.pcname)
+            pcname_b64(&ud.name)
         )
-    });
-
-    Ok(build_jump_url(&resolved, directory, session_id))
+    };
+    build_jump_url(&resolved, directory, session_id)
 }
 
 #[derive(Deserialize)]
@@ -1020,17 +919,19 @@ async fn device_jump(
     Query(q): Query<JumpQuery>,
 ) -> AppResult<impl IntoResponse> {
     let user = current_user(&state, &headers).await?;
-    let (_, _) = parse_device_path(&pctype, &pcname)?;
+    if pctype != "macos" && pctype != "windows" {
+        return Err(AppError::InvalidTarget(format!("bad pctype: {}", pctype)));
+    }
+    validate_pcname(&pcname)?;
     ensure_device_allowed(&user, &pcname)?;
-    let df = state.devices.load().await?;
-    let device = df
+    let ud = user
         .devices
         .iter()
-        .find(|d| d.pctype == pctype && d.pcname == pcname)
-        .ok_or(AppError::NotFound("device".into()))?;
-    let url = compute_jump_url(&state, device, &q.directory, &q.session).await?;
-    let (user, pass) = device_creds_for(&state, device);
-    let url = append_auth_token(&url, &user, &pass);
+        .find(|d| d.name == pcname)
+        .ok_or_else(|| AppError::NotFound("device".into()))?;
+    let (user_cred, pass_cred) = device_credentials(&user);
+    let url = build_jump_url_for(&state, ud, &q.directory, &q.session);
+    let url = append_auth_token(&url, &user_cred, &pass_cred);
     if q.format.as_deref() == Some("json") {
         return Ok(AxumJson(serde_json::json!({"jump_url": url})).into_response());
     }
@@ -1127,7 +1028,6 @@ async fn admin_info(
         .map(|v| v.into_iter().map(|(_, ip)| ip.to_string()).collect())
         .unwrap_or_default();
     let user_count = state.users.load().await?.users.len();
-    let device_count = state.devices.load().await?.devices.len();
     Ok(AxumJson(serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "web_bind": state.config.web_bind,
@@ -1136,12 +1036,10 @@ async fn admin_info(
         "sb_base_url": state.config.sb_base_url,
         "sb_user": state.config.sb_user,
         "sb_password": state.config.sb_password,
-        "rathole_key": state.config.rathole_key,
         "hostname": hostname,
         "local_ips": local_ips,
         "uptime_secs": state.started_at.elapsed().as_secs(),
         "user_count": user_count,
-        "device_count": device_count,
     })))
 }
 

@@ -43,15 +43,6 @@
       {{ creating ? '创建中…' : '+ 新建项目' }}
     </button>
 
-    <DeviceAuthDialog
-      :visible="authVisible"
-      :base-url="authBaseUrl"
-      :busy="authBusy"
-      :error="authError"
-      @submit="submitAuth"
-      @cancel="cancelAuth"
-    />
-
     <NewSessionDialog
       :visible="nsVisible"
       :projects="nsProjects"
@@ -68,27 +59,34 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
-import DeviceAuthDialog from '../components/DeviceAuthDialog.vue'
 import NewSessionDialog from '../components/NewSessionDialog.vue'
-import { useDeviceAuth } from '../deviceAuth'
-import { apiGet, apiPost, ApiError, DEVICE_AUTH_FAILED, UnauthorizedError } from '../api'
-import type { ProjectInfo } from '../api'
+import { apiGet, apiPost, UnauthorizedError } from '../api'
+import type { DeviceDetail, ProjectInfo } from '../api'
+import { buildOcSessionUrl } from '../oc-url'
+import { useAuthStore } from '../store'
 
 const route = useRoute()
-const {
-  visible: authVisible,
-  busy: authBusy,
-  error: authError,
-  baseUrl: authBaseUrl,
-  open: openAuth,
-  submit: submitAuth,
-  cancel: cancelAuth,
-} = useDeviceAuth()
+const auth = useAuthStore()
 const pctype = String(route.params.pctype)
 const pcname = String(route.params.pcname)
 const projects = ref<ProjectInfo[]>([])
 const loading = ref(true)
 const error = ref('')
+
+// 设备端 opencode serve 的 Basic 凭据：进页即预取（失败静默），
+// "新建项目"创建会话后用它构造免弹窗直达 URL。
+const deviceDetail = ref<DeviceDetail | null>(null)
+const deviceEntry = computed(() =>
+  auth.me?.devices.find((x) => x.pctype === pctype && x.name === pcname),
+)
+
+function fetchDetail() {
+  apiGet<DeviceDetail>(`/api/devices/${pctype}/${encodeURIComponent(pcname)}/detail`)
+    .then((d) => {
+      deviceDetail.value = d
+    })
+    .catch(() => {})
+}
 
 // 路径关键字实时过滤（本地，无需确认）：大小写不敏感的子串匹配。
 const keyword = ref('')
@@ -108,12 +106,6 @@ async function load() {
   } catch (e) {
     // 401 由 router 守卫处理（软跳 /login），不显示错误
     if (e instanceof UnauthorizedError) return
-    // 设备端拒绝 BFF 凭据：弹授权框，通过后自动重载
-    // （直接 URL 访问本页时不会经过 DevicesPage 的点击探测）。
-    if (e instanceof ApiError && e.code === DEVICE_AUTH_FAILED) {
-      openAuth(pctype, pcname, '', () => load())
-      return
-    }
     error.value = e instanceof Error ? e.message : String(e)
   } finally {
     loading.value = false
@@ -162,26 +154,31 @@ async function createProject(directory: string) {
   creating.value = true
   nsError.value = ''
   try {
-    const r = await apiPost<{ jump_url: string }>(
+    const r = await apiPost<{ id: string; jump_url: string }>(
       `/api/devices/${pctype}/${encodeURIComponent(pcname)}/sessions`,
       { directory },
     )
     nsVisible.value = false
-    window.open(r.jump_url, '_blank', 'noopener,noreferrer')
+    // 优先免弹窗的自拼 URL（内嵌凭据 + 规范会话路由）；凭据未就绪时
+    // 退回 BFF jump_url（旧格式，可能弹 Basic Auth 框，好过打不开）。
+    const ocUrl =
+      deviceEntry.value && deviceDetail.value
+        ? buildOcSessionUrl(deviceEntry.value, deviceDetail.value, r.id)
+        : ''
+    window.open(ocUrl || r.jump_url, '_blank', 'noopener,noreferrer')
     await load()
   } catch (e) {
     if (e instanceof UnauthorizedError) return
-    if (e instanceof ApiError && e.code === DEVICE_AUTH_FAILED) {
-      openAuth(pctype, pcname, '', () => createProject(directory))
-      return
-    }
     nsError.value = e instanceof Error ? e.message : String(e)
   } finally {
     creating.value = false
   }
 }
 
-onMounted(load)
+onMounted(() => {
+  load()
+  fetchDetail()
+})
 </script>
 
 <style scoped>

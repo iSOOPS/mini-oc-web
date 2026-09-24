@@ -1,121 +1,143 @@
 <template>
   <div v-if="visible" class="overlay" @click.self="$emit('close')">
     <div class="card dialog">
-      <h3>用户设置</h3>
+      <h3>设置</h3>
 
-      <!-- 唯一 ID（只读，创建时生成的 6 位随机数） -->
-      <div class="field">
-        <span class="lbl">唯一 ID</span>
-        <div class="key-row">
-          <code class="key-text">{{ me?.id ?? '—' }}</code>
-          <button class="ghost small-btn" @click="copyId">
-            {{ idCopied ? '已复制' : '复制' }}
-          </button>
+      <!-- 用户信息卡片：唯一 ID / 用户名 / 登录密钥 / 上次使用 -->
+      <section class="section-card">
+        <span class="section-title">用户信息</span>
+
+        <!-- 唯一 ID（只读，创建时生成的 6 位随机数） -->
+        <div class="field">
+          <span class="lbl">唯一 ID</span>
+          <div class="key-row">
+            <code class="key-text">{{ me?.id ?? '—' }}</code>
+            <button class="ghost small-btn" @click="copyId">
+              {{ idCopied ? '已复制' : '复制' }}
+            </button>
+          </div>
+          <span class="muted helper">唯一 ID 由系统分配，不可修改。</span>
         </div>
-        <span class="muted helper">唯一 ID 由系统分配，不可修改。</span>
-      </div>
 
-      <!-- 修改用户名 -->
-      <form @submit.prevent="saveName">
-        <label>
-          <span class="lbl">用户名</span>
-          <input v-model.trim="nameDraft" type="text" maxlength="64" placeholder="字母/数字/_/-，1-64 位" />
-        </label>
-        <div class="row action-row">
-          <button type="submit" class="primary" :disabled="savingName">
-            {{ savingName ? '保存中…' : '修改用户名' }}
-          </button>
+        <!-- 修改用户名 -->
+        <form @submit.prevent="saveName">
+          <label>
+            <span class="lbl">用户名</span>
+            <input v-model.trim="nameDraft" type="text" maxlength="64" placeholder="字母/数字/_/-，1-64 位" />
+          </label>
+          <div class="row action-row">
+            <button type="submit" class="primary" :disabled="savingName">
+              {{ savingName ? '保存中…' : '修改用户名' }}
+            </button>
+          </div>
+        </form>
+
+        <!-- 查看用户密码（登录密钥） -->
+        <div class="field">
+          <span class="lbl">用户密码（登录密钥）</span>
+          <div class="key-row">
+            <code class="key-text">{{ keyRevealed ? myKey : '•'.repeat(32) }}</code>
+            <button class="ghost small-btn" @click="toggleKey">
+              {{ keyRevealed ? '隐藏' : '显示' }}
+            </button>
+            <button v-if="keyRevealed" class="ghost small-btn" @click="copyKey">
+              {{ copied ? '已复制' : '复制' }}
+            </button>
+          </div>
         </div>
-      </form>
 
-      <!-- 查看用户密码（登录密钥） -->
-      <div class="field">
-        <span class="lbl">用户密码（登录密钥）</span>
-        <div class="key-row">
-          <code class="key-text">{{ keyRevealed ? myKey : '•'.repeat(32) }}</code>
-          <button class="ghost small-btn" @click="toggleKey">
-            {{ keyRevealed ? '隐藏' : '显示' }}
-          </button>
-          <button v-if="keyRevealed" class="ghost small-btn" @click="copyKey">
-            {{ copied ? '已复制' : '复制' }}
-          </button>
+        <!-- 上次使用时间 -->
+        <div class="field">
+          <span class="lbl">上次使用时间</span>
+          <div class="value">{{ me?.last_used_at ?? '—' }}</div>
         </div>
-      </div>
+      </section>
 
-      <!-- 上次使用时间 -->
-      <div class="field">
-        <span class="lbl">上次使用时间</span>
-        <div class="value">{{ me?.last_used_at ?? '—' }}</div>
-      </div>
+      <!-- SB 配置卡片（域名/账号/密码，自动填充管理员分配值，可修改） -->
+      <section class="section-card">
+        <span class="section-title">SB 配置</span>
+        <form @submit.prevent="saveSb">
+          <label>
+            <span class="lbl">域名</span>
+            <input v-model.trim="sbUrlDraft" type="text" maxlength="200" placeholder="https://md.isoops.com" />
+          </label>
+          <label>
+            <span class="lbl">账号</span>
+            <input v-model.trim="sbUserDraft" type="text" maxlength="64" placeholder="SB 账号" autocomplete="off" />
+          </label>
+          <label>
+            <span class="lbl">密码</span>
+            <input v-model.trim="sbPassDraft" type="password" maxlength="128" placeholder="SB 密码" autocomplete="new-password" />
+          </label>
+          <span class="muted helper">已自动填充管理员分配的 SB 配置（存储于远程注册表）；如需调整可修改后保存。</span>
+          <div class="row action-row">
+            <button type="submit" class="primary" :disabled="savingSb">
+              {{ savingSb ? '保存中…' : '保存 SB 配置' }}
+            </button>
+          </div>
+        </form>
+      </section>
 
-      <!-- 云服务设置 -->
-      <form @submit.prevent="saveIp">
-        <label>
-          <span class="lbl">云服务 IP</span>
-          <input v-model.trim="ipDraft" type="text" maxlength="64" placeholder="8.159.159.138" />
-        </label>
-        <div class="row action-row">
-          <button type="submit" class="primary" :disabled="savingIp">
-            {{ savingIp ? '保存中…' : '保存 IP' }}
-          </button>
+      <!-- 设备清单卡片（只读：由管理员授权，用户不可修改）。
+           移动端友好：每台设备一张子卡片，标题行 = 设备名 + 可用状态
+           徽章，其余字段按 标签/值 网格自适应排布（窄屏单列、宽屏多列）。 -->
+      <section class="section-card">
+        <span class="section-title">设备清单</span>
+        <div class="device-cards">
+          <div v-for="(d, i) in me?.devices ?? []" :key="i" class="device-card">
+            <div class="device-head">
+              <strong class="device-title">{{ d['device-name'] || d.desc || d.name }}</strong>
+              <span class="pill" :class="availableClass(d.available)">
+                {{ availableText(d.available) }}
+              </span>
+            </div>
+            <dl class="device-grid">
+              <div class="cell">
+                <dt>描述</dt>
+                <dd>{{ d.desc || '—' }}</dd>
+              </div>
+              <div class="cell">
+                <dt>平台</dt>
+                <dd>{{ d.pctype || '—' }}</dd>
+              </div>
+              <div class="cell">
+                <dt>服务名称</dt>
+                <dd>{{ d.name }}</dd>
+              </div>
+              <div class="cell wide">
+                <dt>穿透地址</dt>
+                <dd>{{ d['public-url'] || '—' }}</dd>
+              </div>
+              <div class="cell">
+                <dt>服务端口</dt>
+                <dd>{{ d.port }}</dd>
+              </div>
+              <div class="cell">
+                <dt>oc 端口</dt>
+                <dd>{{ d['oc-port'] ?? '—' }}</dd>
+              </div>
+              <div class="cell">
+                <dt>绑定状态</dt>
+                <dd :class="d.bound ? 'state-on' : 'state-off'">
+                  {{ d.bound ? '已绑定' : '未绑定' }}
+                </dd>
+              </div>
+              <div class="cell">
+                <dt>在线</dt>
+                <dd :class="stateClass(d.online)">{{ stateText(d.online) }}</dd>
+              </div>
+              <div class="cell">
+                <dt>opencode</dt>
+                <dd :class="stateClass(d.opencode_online)">
+                  {{ stateText(d.opencode_online) }}
+                </dd>
+              </div>
+            </dl>
+          </div>
+          <p v-if="(me?.devices ?? []).length === 0" class="muted empty-cell">暂无设备</p>
         </div>
-      </form>
-
-      <!-- SB 配置（域名/账号/密码，自动填充管理员分配值，可修改） -->
-      <form @submit.prevent="saveSb">
-        <span class="lbl">SB 配置</span>
-        <label>
-          <span class="lbl sub">域名</span>
-          <input v-model.trim="sbUrlDraft" type="text" maxlength="200" placeholder="https://md.isoops.com" />
-        </label>
-        <label>
-          <span class="lbl sub">账号</span>
-          <input v-model.trim="sbUserDraft" type="text" maxlength="64" placeholder="SB 账号" autocomplete="off" />
-        </label>
-        <label>
-          <span class="lbl sub">密码</span>
-          <input v-model.trim="sbPassDraft" type="password" maxlength="128" placeholder="SB 密码" autocomplete="new-password" />
-        </label>
-        <span class="muted helper">已自动填充管理员分配的 SB 配置（存储于远程注册表）；如需调整可修改后保存。</span>
-        <div class="row action-row">
-          <button type="submit" class="primary" :disabled="savingSb">
-            {{ savingSb ? '保存中…' : '保存 SB 配置' }}
-          </button>
-        </div>
-      </form>
-
-      <!-- 设备清单（只读：由管理员授权，用户不可修改） -->
-      <div class="field">
-        <span class="lbl">设备清单</span>
-        <table class="devices-table">
-          <thead>
-            <tr>
-              <th>设备名称</th>
-              <th>描述</th>
-              <th>平台</th>
-              <th>服务名称</th>
-              <th>端口号</th>
-              <th>绑定状态</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="(d, i) in me?.devices ?? []" :key="i">
-              <td>{{ d['device-name'] || '—' }}</td>
-              <td>{{ d.desc || '—' }}</td>
-              <td>{{ d.pctype || '—' }}</td>
-              <td>{{ d.name }}</td>
-              <td>{{ d.port }}</td>
-              <td :class="d.bound ? 'bound-on' : 'bound-off'">
-                {{ d.bound ? '已绑定' : '未绑定' }}
-              </td>
-            </tr>
-            <tr v-if="(me?.devices ?? []).length === 0">
-              <td colspan="6" class="muted empty-cell">暂无设备</td>
-            </tr>
-          </tbody>
-        </table>
         <span class="muted helper">设备清单由管理员授权，不可修改；如需变更请联系管理员。</span>
-      </div>
+      </section>
 
       <p v-if="error" class="error">{{ error }}</p>
       <p v-if="notice" class="muted notice">{{ notice }}</p>
@@ -137,15 +159,49 @@ const auth = useAuthStore()
 const me = computed(() => auth.me)
 
 const nameDraft = ref('')
-const ipDraft = ref('')
 const sbUrlDraft = ref('')
 const sbUserDraft = ref('')
 const sbPassDraft = ref('')
 const error = ref('')
 const notice = ref('')
 const savingName = ref(false)
-const savingIp = ref(false)
 const savingSb = ref(false)
+
+function stateText(v: boolean | undefined): string {
+  if (v === undefined) return '—'
+  return v ? '是' : '否'
+}
+
+function stateClass(v: boolean | undefined): string {
+  if (v === undefined) return ''
+  return v ? 'state-on' : 'state-off'
+}
+
+function availableText(v: number | undefined): string {
+  switch (v) {
+    case 1:
+      return '完全可用'
+    case 0:
+      return '部分可用'
+    case -1:
+      return '不可用'
+    default:
+      return '—'
+  }
+}
+
+function availableClass(v: number | undefined): string {
+  switch (v) {
+    case 1:
+      return 'avail-on'
+    case 0:
+      return 'avail-warn'
+    case -1:
+      return 'avail-off'
+    default:
+      return ''
+  }
+}
 
 // 打开时用当前用户信息初始化草稿
 watch(
@@ -155,7 +211,6 @@ watch(
     error.value = ''
     notice.value = ''
     nameDraft.value = me.value?.name ?? ''
-    ipDraft.value = me.value?.cloud_ip ?? ''
     sbUrlDraft.value = me.value?.sb?.base_url ?? 'https://md.isoops.com'
     sbUserDraft.value = me.value?.sb?.username ?? ''
     sbPassDraft.value = me.value?.sb?.password ?? ''
@@ -176,21 +231,6 @@ async function saveName() {
     error.value = e instanceof Error ? e.message : String(e)
   } finally {
     savingName.value = false
-  }
-}
-
-async function saveIp() {
-  error.value = ''
-  notice.value = ''
-  savingIp.value = true
-  try {
-    await apiPost('/api/me/cloud-ip', { ip: ipDraft.value })
-    await auth.probe()
-    notice.value = '云服务 IP 已更新。'
-  } catch (e) {
-    error.value = e instanceof Error ? e.message : String(e)
-  } finally {
-    savingIp.value = false
   }
 }
 
@@ -298,6 +338,24 @@ form,
   flex-direction: column;
   gap: 6px;
 }
+/* 分组卡片：浅色底 + 边框，包裹用户信息 / SB 配置 / 设备清单 */
+.section-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.section-card > .section-title {
+  font-size: 0.9rem;
+  font-weight: 700;
+  color: var(--text);
+}
+.section-card form {
+  gap: 10px;
+}
 label {
   display: flex;
   flex-direction: column;
@@ -308,10 +366,6 @@ label {
   font-weight: 600;
   color: var(--text-muted);
 }
-.lbl.sub {
-  font-size: 0.8rem;
-  font-weight: 500;
-}
 .value {
   font-size: 0.9rem;
   color: var(--text);
@@ -320,38 +374,94 @@ label {
 textarea {
   resize: vertical;
 }
-/* 设备清单只读表格（六列，紧凑字号适配弹框宽度） */
-.devices-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 0.78rem;
+/* 设备清单：每台设备一张子卡片（surface 底与 section-card 的 bg 区分层级）。
+   字段网格 auto-fill 自适应——移动端单列、宽屏多列；穿透地址等长值
+   占满整行（wide）。 */
+.device-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
 }
-.devices-table th,
-.devices-table td {
+.device-card {
+  background: var(--surface);
   border: 1px solid var(--border);
-  padding: 5px 8px;
-  text-align: left;
+  border-radius: var(--radius);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.device-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.device-title {
+  font-size: 0.95rem;
   word-break: break-all;
 }
-.devices-table th {
-  color: var(--text-muted);
-  font-weight: 600;
-  font-size: 0.72rem;
-  background: var(--bg);
+.pill {
+  font-size: 0.75rem;
+  line-height: 1.5;
+  padding: 2px 10px;
+  border-radius: 10px;
   white-space: nowrap;
 }
-.devices-table td {
+.pill.avail-on {
+  background: rgba(47, 133, 90, 0.12);
+  color: var(--success);
+}
+.pill.avail-warn {
+  background: rgba(234, 179, 8, 0.15);
+  color: var(--warn);
+}
+.pill.avail-off {
+  background: rgba(197, 48, 48, 0.12);
+  color: var(--danger);
+}
+.device-grid {
+  margin: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 8px 12px;
+}
+.cell dt {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  margin-bottom: 2px;
+}
+.cell dd {
+  margin: 0;
+  font-size: 0.82rem;
   color: var(--text);
+  word-break: break-all;
+}
+.cell.wide {
+  grid-column: 1 / -1;
 }
 .empty-cell {
   text-align: center;
-  color: var(--text-muted);
+  margin: 4px 0;
 }
-.bound-on {
+.state-on {
   color: var(--success);
 }
-.bound-off {
-  color: var(--text-muted);
+.state-off {
+  color: var(--danger);
+}
+.avail-on {
+  color: var(--success);
+  font-weight: 600;
+}
+.avail-warn {
+  color: var(--warn);
+  font-weight: 600;
+}
+.avail-off {
+  color: var(--danger);
+  font-weight: 600;
 }
 .action-row {
   margin-top: 4px;

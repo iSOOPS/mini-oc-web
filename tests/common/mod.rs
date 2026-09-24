@@ -3,14 +3,14 @@
 //! Builds a real `AppState` by hand (no `AppState::from_env`, no env vars,
 //! no filesystem cookie key, no live SilverBullet login) and pairs it with
 //! wiremock stand-ins:
-//! - one mock server plays SilverBullet (`/.fs/*` documents — devices.json
-//!   plus the multi-tenant `web/opencode/config.md` user registry),
+//! - one mock server plays SilverBullet (`/.fs/*` documents — the
+//!   multi-tenant `web/opencode/config.md` user registry),
 //! - per-test mock servers play the `oc serve` device endpoints
-//!   (`/health`, `/project`, `/session`, `/api/session`).
+//!   (`/health`, `/project`, `/session`, `/api/session`, `/status`).
 //!
-//! Device URLs are not part of `AppState`: devices are discovered from
-//! `devices.json` served by the SB mock, so each test embeds its device
-//! mock URLs there via `one_device_json` / raw `json!` documents.
+//! Device endpoints are addressed per-device by `UserDevice.public_url`
+//! (admin-assigned in the user registry); the BFF hits `<public_url>/status`
+//! directly — no devices.json lookup involved.
 
 #![allow(dead_code)]
 
@@ -18,7 +18,6 @@ use axum::body::Body;
 use axum::http::{header, Method, Request, Response, StatusCode};
 use axum::Router;
 use mini_oc_web::auth::RateLimiter;
-use mini_oc_web::devices::DevicesStore;
 use mini_oc_web::sb::SbClient;
 use mini_oc_web::state::{AppConfig, AppState};
 use mini_oc_web::users::UsersStore;
@@ -30,16 +29,14 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Portal user name baked into the test users registry.
 pub const TEST_USER: &str = "tester";
-/// Unified device-hop credentials baked into the test `AppConfig`
-/// (OPENCODE_SERVER_USERNAME/PASSWORD equivalent — NOT portal login).
-pub const TEST_PASS: &str = "portal-secret";
 /// 32-char login key of the default test user (letters/digits, no symbols).
 pub const TEST_KEY: &str = "k1234567890123456789012345678901";
 /// Stable 6-digit id of the default test user.
 pub const TEST_USER_ID: &str = "100001";
 /// SilverBullet password — doubles as the admin (SB password) login.
 pub const SB_PASS: &str = "sb-secret";
-/// SilverBullet user — selects the `serv/opencode/{user}/devices.json` path.
+/// SilverBullet user — selects the per-user SB paths under
+/// `serv/opencode/{user}/...`.
 pub const SB_USER: &str = "admin";
 /// Session cookie name (mirrors the private const in `src/routes.rs`).
 pub const COOKIE_NAME: &str = "mini_oc_web_session";
@@ -59,11 +56,6 @@ pub const DEFAULT_DEVICES: &[&str] = &[
     "HomeWin",
 ];
 
-/// SB path (without `/.fs/` prefix) of the devices list for [`SB_USER`].
-pub fn devices_fs_path() -> String {
-    format!("serv/opencode/{}/devices.json", SB_USER)
-}
-
 /// SB path of the multi-tenant user registry.
 pub fn users_fs_path() -> &'static str {
     "web/opencode/config.md"
@@ -74,13 +66,17 @@ pub fn cookie_key() -> Vec<u8> {
     (0u8..32).collect()
 }
 
+/// Default `public_url` baked into test device entries when a test doesn't
+/// supply its own — points at the loopback so `me`/`device_status` probes
+/// fail fast (connection refused) instead of egressing to the real fleet.
+pub const TEST_DEFAULT_PUBLIC_URL: &str = "http://127.0.0.1:65530";
+
 /// The multi-tenant user registry document with a single default user
-/// (`tester`, key [`TEST_KEY`]) whose device list is `devices` (port 4040
-/// for every entry — tests only care about the names for isolation; the
-/// desc mirrors the service name, pctype defaults to windows).
-/// `cloud_ip` is a loopback literal so `/api/me`'s runtime status probes
-/// fail fast (connection refused) instead of egressing to the real
-/// fleet-default cloud server.
+/// (`tester`, key [`TEST_KEY`]) whose device list is `devices`. Every
+/// entry carries `public-url = TEST_DEFAULT_PUBLIC_URL` so the BFF
+/// runtime status probes fail fast against a closed port instead of
+/// accidentally hitting a real fleet endpoint. `cloud_ip` is a loopback
+/// literal too (used only by the cloud_ip:port fallback).
 pub fn users_json(devices: &[&str]) -> String {
     serde_json::json!({
         "version": 1,
@@ -91,7 +87,11 @@ pub fn users_json(devices: &[&str]) -> String {
             "cloud_ip": "127.0.0.1",
             "devices": devices
                 .iter()
-                .map(|d| serde_json::json!({"desc": d, "name": d, "port": 4040, "pctype": "windows", "bound": false}))
+                .map(|d| serde_json::json!({
+                    "desc": d, "name": d, "port": 4040,
+                    "pctype": "windows", "bound": false,
+                    "public-url": TEST_DEFAULT_PUBLIC_URL
+                }))
                 .collect::<Vec<_>>(),
             "created_at": "2026-09-13T00:00:00+08:00",
             "updated_at": "2026-09-13T00:00:00+08:00"
@@ -108,10 +108,22 @@ pub fn port_of(uri: &str) -> u16 {
         .unwrap_or(4040)
 }
 
-/// User-registry variant with an explicit `cloud_ip` and per-device
-/// ports parsed from device mock URIs — the coordinates `/api/me`'s
-/// runtime status probes consume (`http://{cloud_ip}:{port}/status`).
-pub fn users_json_with_ports(cloud_ip: &str, name_uris: &[(&str, &str)]) -> String {
+/// `scheme://host` of an HTTP base URL with the port stripped — the
+/// storage shape of `public-url` since ports moved to the dedicated
+/// `port` / `oc-port` fields.
+pub fn host_of(uri: &str) -> String {
+    uri.rsplit_once(':')
+        .map(|(head, _)| head.to_string())
+        .unwrap_or_else(|| uri.to_string())
+}
+
+/// User-registry variant with an explicit tunnel `public-url` (portless
+/// `scheme://host`) per device. The BFF composes its device URLs as
+/// `{public-url}:{port}` (TUI probe/API) and `{public-url}:{oc-port}`
+/// (opencode jump) — the mock port fills both roles so one wiremock
+/// server stands in for the whole device. `cloud_ip` is recorded too
+/// (device→cloud callback address; never a probe target).
+pub fn users_json_with_public_urls(cloud_ip: &str, name_uris: &[(&str, &str)]) -> String {
     serde_json::json!({
         "version": 1,
         "users": [{
@@ -123,7 +135,9 @@ pub fn users_json_with_ports(cloud_ip: &str, name_uris: &[(&str, &str)]) -> Stri
                 .iter()
                 .map(|(name, uri)| serde_json::json!({
                     "desc": name, "name": name, "port": port_of(uri),
-                    "pctype": "windows", "bound": false
+                    "oc-port": port_of(uri),
+                    "pctype": "windows", "bound": false,
+                    "public-url": host_of(uri)
                 }))
                 .collect::<Vec<_>>(),
             "created_at": "2026-09-13T00:00:00+08:00",
@@ -141,7 +155,6 @@ pub fn users_json_with_ports(cloud_ip: &str, name_uris: &[(&str, &str)]) -> Stri
 /// client's auto-relogin).
 pub fn build_state(sb_base_url: &str) -> Arc<AppState> {
     let sb = Arc::new(SbClient::new(sb_base_url, SB_USER, SB_PASS).unwrap());
-    let devices = Arc::new(DevicesStore::new(sb.clone(), SB_USER));
     let users = Arc::new(UsersStore::new(sb.clone(), SB_USER));
     let rate_limiter = Arc::new(RateLimiter::new(5, Duration::from_secs(600)));
     Arc::new(AppState {
@@ -149,20 +162,15 @@ pub fn build_state(sb_base_url: &str) -> Arc<AppState> {
             web_port: 8100,
             web_bind: "127.0.0.1".to_string(),
             web_static_dir: "./web/dist".to_string(),
-            device_user: TEST_USER.to_string(),
-            device_pass: TEST_PASS.to_string(),
             sb_user: SB_USER.to_string(),
             sb_base_url: sb_base_url.to_string(),
             sb_password: SB_PASS.to_string(),
-            rathole_key: format!("{SB_PASS}-rathole"),
             cookie_key: cookie_key(),
             portal_base: "https://oc.example.com".to_string(),
         },
         sb,
-        devices,
         users,
         rate_limiter,
-        device_creds: Arc::new(mini_oc_web::state::DeviceCreds::new()),
         started_at: Instant::now(),
     })
 }
@@ -171,28 +179,6 @@ pub fn build_state(sb_base_url: &str) -> Arc<AppState> {
 /// `tower::ServiceExt::oneshot` requests — no real port is bound.
 pub fn test_app(state: Arc<AppState>) -> Router {
     mini_oc_web::routes::build_router((*state).clone())
-}
-
-/// [`build_state`] for tests that exercise the `/api/me` runtime status
-/// probes: mounts a registry whose `cloud_ip` and per-device ports point
-/// at the given device mock URIs (`port_mappings`: service name → mock
-/// base URL), then wires the `AppState` to the SB mock. Log in
-/// afterwards with [`login_mounted`] — NOT [`login`]/[`login_as`], whose
-/// registry re-mount would shadow this one (wiremock serves the most
-/// recently mounted mock for a path first).
-pub async fn build_state_with_cloud_ip(
-    sb: &MockServer,
-    cloud_ip: &str,
-    port_mappings: &[(&str, &str)],
-) -> Arc<AppState> {
-    sb_get(
-        sb,
-        users_fs_path(),
-        200,
-        &users_json_with_ports(cloud_ip, port_mappings),
-    )
-    .await;
-    build_state(&sb.uri())
 }
 
 /// Body-less request (GET/HEAD or empty POST).
@@ -255,8 +241,7 @@ pub async fn body_json(resp: Response<Body>) -> serde_json::Value {
 }
 
 /// POST `/api/login` against an already-mounted registry and return the
-/// `name=value` cookie pair. For tests that mount their own registry
-/// document (e.g. via [`build_state_with_cloud_ip`]).
+/// `name=value` cookie pair.
 pub async fn login_mounted(app: &Router) -> String {
     let resp = send(
         app,
@@ -357,19 +342,4 @@ pub async fn sb_put_204(server: &MockServer, fs_path: &str) {
         .respond_with(ResponseTemplate::new(204))
         .mount(server)
         .await;
-}
-
-/// A `devices.json` document with a single device pointing at `public_url`.
-pub fn one_device_json(pctype: &str, pcname: &str, public_url: &str) -> String {
-    serde_json::json!({
-        "version": 1,
-        "devices": [{
-            "pctype": pctype,
-            "pcname": pcname,
-            "public_url": public_url,
-            "oc_serve_port": 4040,
-            "version": "1.0.0",
-        }]
-    })
-    .to_string()
 }

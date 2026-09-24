@@ -40,21 +40,37 @@
           <div class="card-meta">
             <span class="chip service">服务名 {{ d.name }}</span>
             <span v-if="d.pctype" class="chip platform">{{ d.pctype }}</span>
-            <span class="chip port">端口 {{ d.port }}</span>
+            <span class="chip port">服务 {{ d.port }}</span>
+            <span class="chip port">oc {{ d['oc-port'] ?? 9464 }}</span>
           </div>
-          <!-- 行3 状态行 -->
+          <!-- 行3 可用状态徽章（按 -1/0/1 红/橙/绿） -->
+          <div class="card-status small">
+            <span class="chip" :class="availableChip(d)">
+              可用：{{ availableText(d) }}
+            </span>
+          </div>
+          <!-- 行4 在线状态 / opencode 状态 -->
           <div class="card-status muted small">
             <div v-if="d.online !== undefined">
-              <span :class="ocServe(d) === 'running' ? 'ok-text' : 'warn-text'">
-                oc serve {{ ocServe(d) }}
+              <span :class="d.online ? 'ok-text' : 'danger-text'">
+                在线 {{ d.online ? '是' : '否' }}
               </span>
-              <template v-if="hostOf(d)"> · {{ hostOf(d) }}</template>
+              <template v-if="d.online"> · </template>
+              <template v-if="d.online">
+                <span :class="d.opencode_online ? 'ok-text' : 'warn-text'">
+                  opencode {{ d.opencode_online ? '在线' : '离线' }}
+                </span>
+              </template>
+              <template v-if="d.online && hostOf(d)"> · {{ hostOf(d) }}</template>
               <span v-if="!d.online && d.reason" class="warn-text"> · {{ d.reason }}</span>
             </div>
             <div v-else>状态未知</div>
           </div>
-          <!-- 行4 云隧道地址 -->
-          <div class="path">{{ cloudBase }}:{{ d.port }}</div>
+          <!-- 行4 设备穿透地址（admin 配置，BFF 以 穿透地址+服务端口号 探测，
+               以 穿透地址+OpenCode 端口号 跳转） -->
+          <div class="path">
+            {{ d['public-url'] ? `${d['public-url']} · 服务:${d.port} · oc:${d['oc-port'] ?? 9464}` : '设备穿透地址未配置' }}
+          </div>
         </a>
       </div>
     </div>
@@ -125,9 +141,8 @@ async function silentFirstLoad() {
   await auth.probe().catch(() => {})
 }
 
-// 用户设备清单（管理员授权）直接驱动卡片;状态通过云隧道主动探测。
+// 用户设备清单（管理员授权）直接驱动卡片;状态通过 admin 配置的设备 URL 主动探测。
 const devices = computed(() => auth.me?.devices ?? [])
-const cloudBase = computed(() => auth.me?.cloud_ip ?? '')
 
 /** 卡片主标题：设备名称（客户端绑定写入）→ 描述 → 服务名。 */
 function displayName(d: UserDevice): string {
@@ -137,9 +152,6 @@ function displayName(d: UserDevice): string {
 function isOnline(d: UserDevice): boolean {
   return d.online === true
 }
-function ocServe(d: UserDevice): string {
-  return d.status?.opencode_serve ?? 'unknown'
-}
 function rathole(d: UserDevice): string {
   return d.status?.rathole ?? 'unknown'
 }
@@ -147,17 +159,44 @@ function hostOf(d: UserDevice): string {
   return d.status?.system?.hostname ?? ''
 }
 
+/** 可用状态文案（-1/0/1 → 不可用 / 部分可用 / 完全可用）。 */
+function availableText(d: UserDevice): string {
+  switch (d.available) {
+    case 1:
+      return '完全可用'
+    case 0:
+      return '部分可用'
+    case -1:
+      return '不可用'
+    default:
+      return '未知'
+  }
+}
+
+/** 可用状态徽章样式类（与点颜色保持一致：红/橙/绿）。 */
+function availableChip(d: UserDevice): string {
+  switch (d.available) {
+    case 1:
+      return 'avail-on'
+    case 0:
+      return 'avail-warn'
+    case -1:
+      return 'avail-off'
+    default:
+      return ''
+  }
+}
+
 /**
- * 状态点颜色（按优先级）：
- * 红 = 未连接上（探测失败 / rathole 未运行）
- * 黄 = 已连上但不可用（未绑定 / oc serve 未运行）
- * 绿 = 完全可用；灰 = 探测中 / 状态未知（数据未到不闪红黄）
+ * 状态点颜色（直接由后端的 `available` 驱动）：
+ * 绿 = 1（完全可用）;橙 = 0（已连接但未完全可用）;红 = -1（不可用）
+ * 数据未到时灰显，避免页面刚加载瞬间闪红/橙。
  */
 function dotClass(d: UserDevice): string {
-  if (d.online === undefined) return 'offline'           // data not arrived yet (silentFirstLoad in flight)
-  if (!d.online || rathole(d) !== 'running') return 'danger'
-  if (!d.bound || ocServe(d) !== 'running') return 'warn'
-  return 'online'
+  if (d.available === undefined) return 'offline'
+  if (d.available === 1) return 'online'
+  if (d.available === 0) return 'warn'
+  return 'danger'
 }
 
 // —— 点击拦截 Toast（页面级单例：新消息替换旧消息并重置计时）——
@@ -182,7 +221,7 @@ function dismissToast() {
 
 // 点击进入项目列表：只有绿点（完全可用）状态才允许导航；
 // 其余状态弹 toast 说明原因 —— 原因判断与 dotClass 同源，按其
-// 优先级顺序细分（offline 灰 / danger 红两种 / warn 黄两种）。
+// 优先级顺序细分（offline 灰 / danger 红 / warn 橙）。
 function onDeviceClick(d: UserDevice) {
   const name = displayName(d)
   const tone = dotClass(d)
@@ -191,18 +230,14 @@ function onDeviceClick(d: UserDevice) {
     return
   }
   if (tone === 'danger') {
-    if (!isOnline(d)) {
-      showToast(`设备「${name}」未连接上（离线），无法进入项目列表`, 'danger')
-    } else {
-      showToast(`设备「${name}」的 rathole 未运行，隧道未连接，无法进入项目列表`, 'danger')
-    }
+    showToast(`设备「${name}」不可用（/status 探测失败），无法进入项目列表`, 'danger')
     return
   }
   if (tone === 'warn') {
     if (!d.bound) {
       showToast(`设备「${name}」未绑定，请先在设备端完成绑定`, 'warn')
     } else {
-      showToast(`设备「${name}」的 oc serve 未启动，请在设备端启动后重试`, 'warn')
+      showToast(`设备「${name}」的 opencode 进程未运行，请在设备端启动后重试`, 'warn')
     }
     return
   }
@@ -356,6 +391,22 @@ onMounted(() => {
 }
 .warn-text {
   color: var(--warn);
+}
+.danger-text {
+  color: var(--danger);
+}
+/* 可用状态徽章：与点色保持一致（绿/橙/红）；沿用 chip 药丸样式 */
+.chip.avail-on {
+  background: rgba(47, 133, 90, 0.12);
+  color: var(--success);
+}
+.chip.avail-warn {
+  background: rgba(217, 119, 6, 0.12);
+  color: var(--warn);
+}
+.chip.avail-off {
+  background: rgba(220, 38, 38, 0.12);
+  color: var(--danger);
 }
 /* 点击拦截 Toast：页面级浮层，沿用项目卡片视觉语言；
    左边框颜色提示状态级别（红/黄/灰）。 */

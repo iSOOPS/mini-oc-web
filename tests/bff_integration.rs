@@ -9,12 +9,10 @@
 
 mod common;
 
-use axum::body::Body;
-use axum::http::{header, Method, Request, StatusCode};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use axum::http::{header, Method, StatusCode};
 use common::*;
 use serial_test::serial;
-use wiremock::matchers::{header as header_matcher, method, path};
+use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // ---------------------------------------------------------------------------
@@ -159,16 +157,16 @@ async fn login_rate_limited_after_5_failures() {
 }
 
 // ---------------------------------------------------------------------------
-// 5-7. /api/devices
+// 5-7. /api/me (the only "list my devices" endpoint after the C plan)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 #[serial]
-async fn devices_requires_session() {
+async fn me_requires_session() {
     let sb = MockServer::start().await;
     let app = test_app(build_state(&sb.uri()));
 
-    let resp = send(&app, req(Method::GET, "/api/devices")).await;
+    let resp = send(&app, req(Method::GET, "/api/me")).await;
 
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     let body = body_json(resp).await;
@@ -177,73 +175,26 @@ async fn devices_requires_session() {
 
 #[tokio::test]
 #[serial]
-async fn devices_returns_empty_when_no_devices() {
+async fn me_devices_empty_when_user_has_no_devices() {
+    // After the C plan removed devices.json, `/api/me.devices` reflects
+    // the user registry's `devices` list directly. A user with an empty
+    // list must surface an empty array (NOT a 503 from a missing
+    // devices.json — that path no longer exists).
     let sb = MockServer::start().await;
-    // devices.json does not exist yet → the cache falls back to an empty list.
-    sb_get_404(&sb, &devices_fs_path()).await;
+    sb_get(
+        &sb,
+        users_fs_path(),
+        200,
+        r#"{"version":1,"users":[{"id":"100001","name":"tester","key":"k1234567890123456789012345678901","cloud_ip":"127.0.0.1","devices":[],"created_at":"2026-09-13T00:00:00+08:00","updated_at":"2026-09-13T00:00:00+08:00"}]}"#,
+    )
+    .await;
     let app = test_app(build_state(&sb.uri()));
-    let cookie = login(&app, &sb).await;
-
-    let resp = send(&app, authed_get("/api/devices", &cookie)).await;
-
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(body_json(resp).await, serde_json::json!([]));
-}
-
-#[tokio::test]
-#[serial]
-async fn devices_returns_online_status_from_health() {
-    let sb = MockServer::start().await;
-    let online_dev = MockServer::start().await;
-    let offline_dev = MockServer::start().await;
-
-    // The BFF probes `<public_url>/health` per device: 2xx → online.
-    Mock::given(method("GET"))
-        .and(path("/health"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(1)
-        .mount(&online_dev)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/health"))
-        .respond_with(ResponseTemplate::new(503))
-        .expect(1)
-        .mount(&offline_dev)
-        .await;
-
-    let devices_json = serde_json::json!({
-        "version": 1,
-        "devices": [
-            {"pctype": "macos", "pcname": "dev-online", "public_url": online_dev.uri(), "oc_serve_port": 4040},
-            {"pctype": "windows", "pcname": "dev-offline", "public_url": offline_dev.uri(), "oc_serve_port": 4040},
-        ]
-    })
-    .to_string();
-    sb_get(&sb, &devices_fs_path(), 200, &devices_json).await;
-
-    let app = test_app(build_state(&sb.uri()));
-    let cookie = login(&app, &sb).await;
-
-    let resp = send(&app, authed_get("/api/devices", &cookie)).await;
-
+    let cookie = login_mounted(&app).await;
+    let resp = send(&app, authed_get("/api/me", &cookie)).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await;
-    let devices = body.as_array().expect("devices list");
-    assert_eq!(devices.len(), 2);
-
-    let online = devices
-        .iter()
-        .find(|d| d["pcname"] == "dev-online")
-        .expect("dev-online present");
-    assert_eq!(online["online"], true);
-    assert_eq!(online["pcname_b64"], b64url("dev-online"));
-    assert_eq!(online["portal_base"], "https://oc.example.com");
-
-    let offline = devices
-        .iter()
-        .find(|d| d["pcname"] == "dev-offline")
-        .expect("dev-offline present");
-    assert_eq!(offline["online"], false);
+    assert!(body["devices"].is_array(), "devices field must be an array");
+    assert_eq!(body["devices"].as_array().unwrap().len(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -257,15 +208,17 @@ async fn device_projects_returns_proxy_data() {
 
     // Projects come from the SB-side path-list.md registry (maintained by
     // the mini-oc-gui end-side), not the device's live API. Multi-tenant
-    // location: serv/opencode/{user_id}/{pctype}/{device-name}/path-list.md
-    // — the tester registry entry assigns pctype "windows" and carries no
-    // device-name yet, so the segment falls back to the service name.
+    // location: serv/opencode/{user_id}/{pctype}/{pcname}/path-list.md —
+    // the third segment is the device SERVICE NAME (registry entry's
+    // `name`, same as the URL pcname), NOT the client-reported
+    // device-name. Sections are objects (live wire shape, verified
+    // against the real SB document).
     sb_get(
         &sb,
         "serv/opencode/100001/windows/dev-one/path-list.md",
         200,
         r#"[
-            {"path":"D:/work/api","sections":["s1"],"createdAt":"2026-09-01T10:00:00+08:00","lastOpenedAt":"2026-09-02T10:00:00+08:00"},
+            {"path":"D:/work/api","sections":[{"id":"s1","title":"api session","directory":"D:/work/api/","createdAt":"2026-09-01T10:00:00+08:00","updatedAt":"2026-09-02T09:00:00+08:00"}],"createdAt":"2026-09-01T10:00:00+08:00","lastOpenedAt":"2026-09-02T10:00:00+08:00"},
             {"path":"D:/work/gui","sections":[]}
         ]"#,
     )
@@ -317,8 +270,8 @@ async fn device_sessions_returns_proxy_data() {
         "serv/opencode/100001/windows/dev-one/path-list.md",
         200,
         r#"[
-            {"path":"D:/work/api","sections":["s1","s2"],"createdAt":"2026-09-01T10:00:00+08:00","lastOpenedAt":"2026-09-03T11:00:00+08:00"},
-            {"path":"D:/work/other","sections":["s9"]}
+            {"path":"D:/work/api","sections":[{"id":"s1","title":"one","createdAt":"2026-09-01T10:00:00+08:00","updatedAt":"2026-09-03T10:00:00+08:00"},{"id":"s2","createdAt":"2026-09-01T10:00:00+08:00"}],"createdAt":"2026-09-01T10:00:00+08:00","lastOpenedAt":"2026-09-03T11:00:00+08:00"},
+            {"path":"D:/work/other","sections":[{"id":"s9","title":"x","createdAt":"2026-09-01T10:00:00+08:00"}]}
         ]"#,
     )
     .await;
@@ -340,8 +293,11 @@ async fn device_sessions_returns_proxy_data() {
     assert_eq!(body.as_array().unwrap().len(), 2);
     assert_eq!(body[0]["id"], "s1");
     assert_eq!(body[1]["id"], "s2");
-    // updatedAt carries the path entry's lastOpenedAt.
-    assert_eq!(body[0]["updatedAt"], "2026-09-03T11:00:00+08:00");
+    // Section-level title and updatedAt map through when present.
+    assert_eq!(body[0]["title"], "one");
+    assert_eq!(body[0]["updatedAt"], "2026-09-03T10:00:00+08:00");
+    // Sections without updatedAt fall back to the entry's lastOpenedAt.
+    assert_eq!(body[1]["updatedAt"], "2026-09-03T11:00:00+08:00");
 }
 
 #[tokio::test]
@@ -360,16 +316,14 @@ async fn device_create_session_returns_jump_url() {
         .await;
     sb_get(
         &sb,
-        &devices_fs_path(),
+        users_fs_path(),
         200,
-        &one_device_json("macos", "dev-one", &device.uri()),
+        &users_json_with_public_urls("127.0.0.1", &[("dev-one", &device.uri())]),
     )
     .await;
-    // The jump URL is built from devices.json's public_url (the device
-    // mock itself) — no config.md overrides any more.
 
     let app = test_app(build_state(&sb.uri()));
-    let cookie = login(&app, &sb).await;
+    let cookie = login_mounted(&app).await;
 
     let resp = send(
         &app,
@@ -390,175 +344,18 @@ async fn device_create_session_returns_jump_url() {
         "{}/{}/session/sess-42?auth_token={}",
         device.uri(),
         b64url("/work/api"),
-        auth_token_query(TEST_USER, TEST_PASS)
+        auth_token_query(TEST_USER_ID, TEST_KEY)
     );
     assert_eq!(body["jump_url"], expected_jump);
 }
 
-/// `?auth_token=` value the BFF embeds for the unified test credentials
-/// (standard base64 of `user:password`, percent-encoded — see
-/// `jump::append_auth_token`).
+/// `?auth_token=` value the BFF embeds for the signed-in user's own
+/// account credentials — standard base64 of `{user id}:{login key}`,
+/// percent-encoded (see `jump::append_auth_token`).
 fn auth_token_query(user: &str, pass: &str) -> String {
     use base64::Engine;
     let token = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", user, pass));
     urlencoding::encode(&token).to_string()
-}
-
-// ---------------------------------------------------------------------------
-// 14. seed
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-#[serial]
-async fn seed_writes_demo_device() {
-    let sb = MockServer::start().await;
-    // Start with no devices.json → seed must create the file content.
-    sb_get_404(&sb, &devices_fs_path()).await;
-    sb_put_204(&sb, &devices_fs_path()).await;
-
-    let app = test_app(build_state(&sb.uri()));
-    let cookie = login(&app, &sb).await;
-
-    let resp = send(
-        &app,
-        json_req(
-            Method::POST,
-            "/api/devices/seed",
-            &serde_json::json!({
-                "pcname": "dev-seed",
-                "public_url": "http://127.0.0.1:9999",
-                "pctype": "windows",
-            }),
-            Some(&cookie),
-        ),
-    )
-    .await;
-
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(body_json(resp).await, serde_json::json!({"ok": true}));
-
-    // The demo device must have been written to SB's devices.json.
-    sb.verify().await;
-    let devices_http_path = format!("/.fs/{}", devices_fs_path());
-    let writes: Vec<_> = sb
-        .received_requests()
-        .await
-        .expect("wiremock records requests")
-        .into_iter()
-        .filter(|r| r.method.as_str() == "PUT" && r.url.path() == devices_http_path)
-        .collect();
-    assert_eq!(writes.len(), 1, "exactly one devices.json write");
-    let written: serde_json::Value = serde_json::from_slice(&writes[0].body).unwrap();
-    let devices = written["devices"].as_array().expect("devices array");
-    let seeded = devices
-        .iter()
-        .find(|d| d["pcname"] == "dev-seed")
-        .expect("demo device written");
-    assert_eq!(seeded["pctype"], "windows");
-    assert_eq!(seeded["public_url"], "http://127.0.0.1:9999");
-}
-
-// ---------------------------------------------------------------------------
-// 15. device delete
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-#[serial]
-async fn device_delete_removes_seeded_device() {
-    let sb = MockServer::start().await;
-    sb_get(
-        &sb,
-        &devices_fs_path(),
-        200,
-        &serde_json::json!({
-            "version": 1,
-            "devices": [
-                {"pctype": "windows", "pcname": "dev-seed", "public_url": "http://127.0.0.1:9999", "oc_serve_port": 4040},
-                {"pctype": "macos", "pcname": "auto-reg", "public_url": "http://127.0.0.1:8888", "oc_serve_port": 4040, "version": "1.18.30"}
-            ]
-        })
-        .to_string(),
-    )
-    .await;
-    sb_put_204(&sb, &devices_fs_path()).await;
-
-    let app = test_app(build_state(&sb.uri()));
-    let cookie = login(&app, &sb).await;
-
-    // Delete the seeded (manually added) device.
-    let resp = send(
-        &app,
-        Request::builder()
-            .method(Method::DELETE)
-            .uri("/api/devices/windows/dev-seed")
-            .header(header::COOKIE, &cookie)
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(body_json(resp).await, serde_json::json!({"ok": true}));
-
-    // The PUT written back to SB keeps the auto-registered device only.
-    let devices_http_path = format!("/.fs/{}", devices_fs_path());
-    let writes: Vec<_> = sb
-        .received_requests()
-        .await
-        .expect("wiremock records requests")
-        .into_iter()
-        .filter(|r| r.method.as_str() == "PUT" && r.url.path() == devices_http_path)
-        .collect();
-    assert_eq!(writes.len(), 1, "exactly one devices.json write");
-    let written: serde_json::Value = serde_json::from_slice(&writes[0].body).unwrap();
-    let devices = written["devices"].as_array().expect("devices array");
-    assert_eq!(devices.len(), 1);
-    assert_eq!(devices[0]["pcname"], "auto-reg");
-}
-
-#[tokio::test]
-#[serial]
-async fn device_delete_unknown_returns_404() {
-    let sb = MockServer::start().await;
-    sb_get(
-        &sb,
-        &devices_fs_path(),
-        200,
-        &serde_json::json!({"version": 1, "devices": []}).to_string(),
-    )
-    .await;
-
-    let app = test_app(build_state(&sb.uri()));
-    let cookie = login(&app, &sb).await;
-
-    let resp = send(
-        &app,
-        Request::builder()
-            .method(Method::DELETE)
-            .uri("/api/devices/macos/ghost")
-            .header(header::COOKIE, &cookie)
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-#[serial]
-async fn device_delete_requires_session() {
-    let sb = MockServer::start().await;
-    let app = test_app(build_state(&sb.uri()));
-
-    let resp = send(
-        &app,
-        Request::builder()
-            .method(Method::DELETE)
-            .uri("/api/devices/macos/any")
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 // ---------------------------------------------------------------------------
@@ -567,18 +364,21 @@ async fn device_delete_requires_session() {
 
 #[tokio::test]
 #[serial]
-async fn device_detail_reports_identity_and_unified_credentials() {
+async fn device_detail_reports_identity_and_user_credentials() {
     let sb = MockServer::start().await;
     sb_get(
         &sb,
-        &devices_fs_path(),
+        users_fs_path(),
         200,
-        &one_device_json("windows", "HomeWin", "http://127.0.0.1:9464"),
+        &users_json_with_public_urls(
+            "127.0.0.1",
+            &[("HomeWin", "http://127.0.0.1:9464")],
+        ),
     )
     .await;
 
     let app = test_app(build_state(&sb.uri()));
-    let cookie = login(&app, &sb).await;
+    let cookie = login_mounted(&app).await;
 
     let resp = send(
         &app,
@@ -589,74 +389,9 @@ async fn device_detail_reports_identity_and_unified_credentials() {
     let body = body_json(resp).await;
     assert_eq!(body["pctype"], "windows");
     assert_eq!(body["pcname"], "HomeWin");
-    assert_eq!(body["public_url"], "http://127.0.0.1:9464");
-    assert_eq!(body["username"], TEST_USER);
-    assert_eq!(body["password"], TEST_PASS);
-}
-
-#[tokio::test]
-#[serial]
-async fn device_detail_prefers_cached_credentials() {
-    let sb = MockServer::start().await;
-    let device = MockServer::start().await;
-    // /project mock: 200 only for the device-user pair, 401 otherwise.
-    // wiremock checks mocks in mounting order (first mounted wins), so
-    // the specific header-matching mock must come BEFORE the catch-all.
-    Mock::given(method("GET"))
-        .and(path("/project"))
-        .and(header_matcher(
-            "authorization",
-            format!("Basic {}", STANDARD.encode("device-user:device-pass")),
-        ))
-        .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
-        .mount(&device)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/project"))
-        .respond_with(ResponseTemplate::new(401))
-        .mount(&device)
-        .await;
-    sb_get(
-        &sb,
-        &devices_fs_path(),
-        200,
-        &one_device_json("windows", "HomeWin", &device.uri()),
-    )
-    .await;
-
-    let app = test_app(build_state(&sb.uri()));
-    let cookie = login(&app, &sb).await;
-
-    // Before authorizing: unified pair.
-    let resp = send(
-        &app,
-        authed_get("/api/devices/windows/HomeWin/detail", &cookie),
-    )
-    .await;
-    assert_eq!(body_json(resp).await["username"], TEST_USER);
-
-    // Authorize with the device's own pair.
-    let resp = send(
-        &app,
-        json_req(
-            Method::POST,
-            "/api/devices/windows/HomeWin/auth",
-            &serde_json::json!({"username": "device-user", "password": "device-pass"}),
-            Some(&cookie),
-        ),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    // After: detail reports the cached pair.
-    let resp = send(
-        &app,
-        authed_get("/api/devices/windows/HomeWin/detail", &cookie),
-    )
-    .await;
-    let body = body_json(resp).await;
-    assert_eq!(body["username"], "device-user");
-    assert_eq!(body["password"], "device-pass");
+    assert_eq!(body["public_url"], "http://127.0.0.1");
+    assert_eq!(body["username"], TEST_USER_ID);
+    assert_eq!(body["password"], TEST_KEY);
 }
 
 #[tokio::test]
@@ -688,19 +423,22 @@ async fn me_returns_enriched_devices_with_runtime_status() {
         .mount(&online_dev)
         .await;
 
-    // Registry with cloud_ip=127.0.0.1 and per-device ports matching the
-    // mock servers — the me handler probes http://{cloud_ip}:{port}/status.
-    let app = test_app(
-        build_state_with_cloud_ip(
-            &sb,
+    // Each device's public-url lives on its own UserDevice entry; the
+    // BFF probes `<public-url>/status` per entry.
+    sb_get(
+        &sb,
+        users_fs_path(),
+        200,
+        &users_json_with_public_urls(
             "127.0.0.1",
             &[
                 ("dev-online", online_dev.uri().as_str()),
                 ("dev-offline", offline_dev.uri().as_str()),
             ],
-        )
-        .await,
-    );
+        ),
+    )
+    .await;
+    let app = test_app(build_state(&sb.uri()));
     let cookie = login_mounted(&app).await;
 
     let resp = send(&app, authed_get("/api/me", &cookie)).await;
@@ -717,6 +455,8 @@ async fn me_returns_enriched_devices_with_runtime_status() {
     assert!(online["status"].is_object());
     assert_eq!(online["status"]["opencode_serve"], "running");
     assert_eq!(online["status"]["system"]["hostname"], "box1");
+    assert_eq!(online["opencode_online"], true);
+    assert_eq!(online["available"], 0);
 
     let offline = devices
         .iter()
@@ -724,4 +464,190 @@ async fn me_returns_enriched_devices_with_runtime_status() {
         .unwrap();
     assert_eq!(offline["online"], false);
     assert!(offline["reason"].is_string());
+    assert_eq!(offline["opencode_online"], false);
+    assert_eq!(offline["available"], -1);
+}
+
+/// `/api/me` rolls `available` up to `1` (green) only when bound + online
+/// + opencode_online all hold; the test wires a registry with `bound=true`
+/// against an online mock returning opencode_serve="running".
+#[tokio::test]
+#[serial]
+async fn me_available_is_one_when_bound_and_running() {
+    let sb = MockServer::start().await;
+    let device = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"opencode_serve":"running","rathole":"running","system":{"hostname":"box"}}"#,
+        ))
+        .mount(&device)
+        .await;
+
+    sb_get(
+        &sb,
+        users_fs_path(),
+        200,
+        &serde_json::json!({
+            "version": 1,
+            "users": [{
+                "id": TEST_USER_ID,
+                "name": TEST_USER,
+                "key": TEST_KEY,
+                "cloud_ip": "127.0.0.1",
+                "devices": [{
+                    "desc": "d", "name": "d", "port": port_of(&device.uri()),
+                    "pctype": "windows", "bound": true,
+                    "public-url": host_of(&device.uri())
+                }],
+                "created_at": "2026-09-13T00:00:00+08:00",
+                "updated_at": "2026-09-13T00:00:00+08:00"
+            }]
+        })
+        .to_string(),
+    )
+    .await;
+    let app = test_app(build_state(&sb.uri()));
+    let cookie = login_mounted(&app).await;
+
+    let resp = send(&app, authed_get("/api/me", &cookie)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let d = &body["devices"][0];
+    assert_eq!(d["bound"], true);
+    assert_eq!(d["online"], true);
+    assert_eq!(d["opencode_online"], true);
+    assert_eq!(d["available"], 1);
+}
+
+/// When /status answers but `opencode_serve` is anything other than the
+/// literal `"running"` (e.g. `"stopped"`), opencode_online must be false
+/// and available must be `0` (reachable but oc not running), regardless of
+/// the bound flag.
+#[tokio::test]
+#[serial]
+async fn me_available_is_zero_when_opencode_serve_stopped() {
+    let sb = MockServer::start().await;
+    let device = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"opencode_serve":"stopped","rathole":"running"}"#,
+        ))
+        .mount(&device)
+        .await;
+
+    sb_get(
+        &sb,
+        users_fs_path(),
+        200,
+        &serde_json::json!({
+            "version": 1,
+            "users": [{
+                "id": TEST_USER_ID,
+                "name": TEST_USER,
+                "key": TEST_KEY,
+                "cloud_ip": "127.0.0.1",
+                "devices": [{
+                    "desc": "d", "name": "d", "port": port_of(&device.uri()),
+                    "pctype": "windows", "bound": true,
+                    "public-url": host_of(&device.uri())
+                }],
+                "created_at": "2026-09-13T00:00:00+08:00",
+                "updated_at": "2026-09-13T00:00:00+08:00"
+            }]
+        })
+        .to_string(),
+    )
+    .await;
+    let app = test_app(build_state(&sb.uri()));
+    let cookie = login_mounted(&app).await;
+
+    let resp = send(&app, authed_get("/api/me", &cookie)).await;
+    let body = body_json(resp).await;
+    let d = &body["devices"][0];
+    assert_eq!(d["online"], true, "/status answered");
+    assert_eq!(d["opencode_online"], false, "opencode_serve != running");
+    assert_eq!(d["available"], 0);
+}
+
+/// Regression: `/api/me`'s status probe MUST hit each device's own
+/// `public_url` (admin-assigned per `UserDevice`), not a shared cloud
+/// gateway. Otherwise every bound device collapses onto whichever
+/// backend is up at the gateway and `online=true` for all of them —
+/// the bug fixed earlier. The test mounts three device mocks (mac +
+/// win answer /status with distinct hostnames, no-mock has no mock
+/// mounted) and asserts each device surfaces its own state; the
+/// "no-mock must be offline" assertion is the regression check.
+#[tokio::test]
+#[serial]
+async fn me_probes_each_device_at_its_own_public_url() {
+    let sb = MockServer::start().await;
+    let mac = MockServer::start().await;
+    let win = MockServer::start().await;
+    let no_mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"opencode_serve":"running","rathole":"running","system":{"hostname":"mac-host"}}"#,
+        ))
+        .mount(&mac)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"opencode_serve":"running","rathole":"running","system":{"hostname":"win-host"}}"#,
+        ))
+        .mount(&win)
+        .await;
+
+    sb_get(
+        &sb,
+        users_fs_path(),
+        200,
+        &users_json_with_public_urls(
+            "127.0.0.1",
+            &[
+                ("dev-mac", mac.uri().as_str()),
+                ("dev-win", win.uri().as_str()),
+                ("dev-no-mock", no_mock.uri().as_str()),
+            ],
+        ),
+    )
+    .await;
+
+    let app = test_app(build_state(&sb.uri()));
+    let cookie = login_mounted(&app).await;
+
+    let resp = send(&app, authed_get("/api/me", &cookie)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let devices = body["devices"].as_array().expect("devices[]");
+    assert_eq!(devices.len(), 3);
+
+    let mac_d = devices.iter().find(|d| d["name"] == "dev-mac").unwrap();
+    assert_eq!(mac_d["online"], true, "mac mock answered");
+    assert_eq!(mac_d["status"]["system"]["hostname"], "mac-host");
+    assert_eq!(mac_d["opencode_online"], true);
+    assert_eq!(mac_d["available"], 1);
+
+    let win_d = devices.iter().find(|d| d["name"] == "dev-win").unwrap();
+    assert_eq!(win_d["online"], true, "win mock answered");
+    assert_eq!(win_d["status"]["system"]["hostname"], "win-host");
+    assert_eq!(win_d["opencode_online"], true);
+    assert_eq!(win_d["available"], 1);
+
+    // THE regression assertion: with the bug present, the no-mock device
+    // would also report online=true because all probes funneled through
+    // the same shared cloud gateway. After the fix, it must surface as
+    // offline — its own public_url returns connection refused.
+    let off_d = devices.iter().find(|d| d["name"] == "dev-no-mock").unwrap();
+    assert_eq!(
+        off_d["online"], false,
+        "no-mock device must NOT inherit online from a sibling device"
+    );
+    assert_eq!(off_d["opencode_online"], false);
+    assert_eq!(off_d["available"], -1);
+    assert!(off_d["reason"].is_string());
 }
