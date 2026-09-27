@@ -115,7 +115,7 @@
                 v-model.trim="formSbUrl"
                 type="text"
                 maxlength="200"
-                placeholder="https://md.isoops.com"
+                placeholder="https://sb.example.com"
               />
             </label>
             <label>
@@ -156,7 +156,7 @@
               </div>
             </label>
             <span class="muted helper">
-              分配给该用户的 SB 存储配置（域名默认 https://md.isoops.com）；用户登录后可在设置中查看并按需修改。
+              分配给该用户的 SB 存储配置（域名默认 https://sb.example.com）；用户登录后可在设置中查看并按需修改。
             </span>
           </section>
 
@@ -348,8 +348,9 @@ function toggleSecret(k: 'sb') {
   secretRevealed.value = { ...secretRevealed.value, [k]: !secretRevealed.value[k] }
 }
 
-function mask(value: string): string {
-  return '•'.repeat(value.length)
+function mask(value: string | undefined): string {
+  // 后端字段缺失/为空时兜底为空串，避免 undefined.length 崩溃渲染
+  return '•'.repeat(value?.length ?? 0)
 }
 
 // --- 用户列表 ---
@@ -419,7 +420,7 @@ interface FormDevice {
 const formDevices = ref<FormDevice[]>([])
 
 // --- SB存储配置分配草稿（域名默认 fleet 域名） ---
-const DEFAULT_SB_URL = 'https://md.isoops.com'
+const DEFAULT_SB_URL = 'http://127.0.0.1:3000'
 const formSbUrl = ref(DEFAULT_SB_URL)
 const formSbUser = ref('')
 const formSbPass = ref('')

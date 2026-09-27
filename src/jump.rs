@@ -17,7 +17,7 @@ pub fn build_jump_url(base_url: &str, directory: &str, session_id: &str) -> Stri
 }
 
 /// URL-safe base64 (no padding) encoding of the device pcname. Used as the
-/// first URL segment on `oc.isoops.com/{b64pc}/...` so nginx can dispatch to
+/// first URL segment on `oc.example.com/{b64pc}/...` so nginx can dispatch to
 /// the matching rathole upstream.
 #[must_use]
 pub fn pcname_b64(pcname: &str) -> String {

@@ -23,7 +23,7 @@ export const router = createRouter({
       component: SessionsPage,
     },
     { path: '/', redirect: '/devices' },
-    // Device deep-link passthrough: clicking an old `/samuel/...` URL inside
+    // Device deep-link passthrough: clicking an old `/{pcname}/...` URL inside
     // the SPA must navigate there directly. We do NOT route through the SPA
     // for these — the BFF already redirects to the rathole upstream, so the
     // browser just loads it as-is.

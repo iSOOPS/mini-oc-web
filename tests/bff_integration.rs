@@ -372,7 +372,7 @@ async fn device_detail_reports_identity_and_user_credentials() {
         200,
         &users_json_with_public_urls(
             "127.0.0.1",
-            &[("HomeWin", "http://127.0.0.1:9464")],
+            &[("demo-pc", "http://127.0.0.1:9464")],
         ),
     )
     .await;
@@ -382,13 +382,13 @@ async fn device_detail_reports_identity_and_user_credentials() {
 
     let resp = send(
         &app,
-        authed_get("/api/devices/windows/HomeWin/detail", &cookie),
+        authed_get("/api/devices/windows/demo-pc/detail", &cookie),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await;
     assert_eq!(body["pctype"], "windows");
-    assert_eq!(body["pcname"], "HomeWin");
+    assert_eq!(body["pcname"], "demo-pc");
     assert_eq!(body["public_url"], "http://127.0.0.1");
     assert_eq!(body["username"], TEST_USER_ID);
     assert_eq!(body["password"], TEST_KEY);
@@ -400,7 +400,7 @@ async fn device_detail_requires_session() {
     let sb = MockServer::start().await;
     let app = test_app(build_state(&sb.uri()));
 
-    let resp = send(&app, req(Method::GET, "/api/devices/windows/HomeWin/detail")).await;
+    let resp = send(&app, req(Method::GET, "/api/devices/windows/demo-pc/detail")).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -630,13 +630,16 @@ async fn me_probes_each_device_at_its_own_public_url() {
     assert_eq!(mac_d["online"], true, "mac mock answered");
     assert_eq!(mac_d["status"]["system"]["hostname"], "mac-host");
     assert_eq!(mac_d["opencode_online"], true);
-    assert_eq!(mac_d["available"], 1);
+    // bound=false in the fixture → reachable-but-not-bound (0). The
+    // available==1 (bound AND online AND running) path is covered by
+    // me_available_is_one_when_bound_and_running.
+    assert_eq!(mac_d["available"], 0);
 
     let win_d = devices.iter().find(|d| d["name"] == "dev-win").unwrap();
     assert_eq!(win_d["online"], true, "win mock answered");
     assert_eq!(win_d["status"]["system"]["hostname"], "win-host");
     assert_eq!(win_d["opencode_online"], true);
-    assert_eq!(win_d["available"], 1);
+    assert_eq!(win_d["available"], 0);
 
     // THE regression assertion: with the bug present, the no-mock device
     // would also report online=true because all probes funneled through

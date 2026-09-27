@@ -2,8 +2,8 @@
 //!
 //! Authentication mirrors `mini-oc-gui`'s `RemoteClient`:
 //! - POST `/.auth` with form `username` + `password`
-//! - Cookie name is derived from the host: `https://md.isoops.com` →
-//!   `auth_md_isoops_com` (dots → underscores).
+//! - Cookie name is derived from the host: `https://sb.example.com` →
+//!   `auth_sb_example_com` (dots → underscores).
 //! - On a 401 from `/.fs/*`, we transparently re-login once and retry.
 //!
 //! This is the only path that actually works against a real SB 2.9+; the
@@ -49,7 +49,7 @@ impl SbClient {
         })
     }
 
-    /// The cookie name the server uses for this host (e.g. `auth_md_isoops_com`).
+    /// The cookie name the server uses for this host (e.g. `auth_sb_example_com`).
     #[must_use]
     pub fn cookie_name(&self) -> &str {
         &self.cookie_name
@@ -175,7 +175,7 @@ impl SbClient {
     }
 }
 
-/// `https://md.isoops.com` → `auth_md_isoops_com`.
+/// `https://sb.example.com` → `auth_sb_example_com`.
 fn derive_cookie_name(base_url: &str) -> String {
     let after_scheme = base_url.split_once("://").map_or(base_url, |(_, r)| r);
     let host_and_port = after_scheme.split('/').next().unwrap_or(after_scheme);
@@ -204,8 +204,8 @@ mod tests {
     #[test]
     fn derive_cookie_name_basic() {
         assert_eq!(
-            derive_cookie_name("https://md.isoops.com"),
-            "auth_md_isoops_com"
+            derive_cookie_name("https://sb.example.com"),
+            "auth_sb_example_com"
         );
         assert_eq!(
             derive_cookie_name("http://127.0.0.1:3000"),

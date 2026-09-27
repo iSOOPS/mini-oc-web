@@ -11,7 +11,7 @@
             v-model="directory"
             type="text"
             list="ns-project-list"
-            placeholder="如 /Users/samuel/projects/foo"
+            placeholder="如 ~/projects/foo"
             :readonly="lockDirectory"
             required
           />

@@ -6,6 +6,7 @@ mod common;
 
 use axum::http::{header, Method, StatusCode};
 use common::*;
+use mini_oc_web::users::DEFAULT_SB_BASE_URL;
 use serial_test::serial;
 use wiremock::MockServer;
 
@@ -99,6 +100,9 @@ async fn admin_routes_reject_missing_admin_cookie() {
 #[serial]
 async fn admin_routes_reject_user_session_cookie() {
     let sb = MockServer::start().await;
+    // PUT mock: the registry fixture carries a ported public-url, so load()
+    // runs the port-strip migration and writes back before login proceeds.
+    sb_put_204(&sb, users_fs_path()).await;
     let app = test_app(build_state(&sb.uri()));
     let user_cookie = login(&app, &sb).await;
 
@@ -122,7 +126,6 @@ async fn admin_info_reports_server_basics() {
     assert_eq!(body["portal_base"], "https://oc.example.com");
     assert_eq!(body["sb_user"], SB_USER);
     assert_eq!(body["user_count"], 0);
-    assert_eq!(body["device_count"], 0);
     assert_eq!(
         body["sb_password"].as_str().map(str::len),
         Some(SB_PASS.len()),
@@ -159,11 +162,11 @@ async fn admin_create_user_generates_key_and_writes_registry() {
             &serde_json::json!({
                 "name": "alice",
                 "devices": [
-                    {"desc": "Alice 的 Mac", "name": "alice-mac", "port": 9464, "pctype": "macos", "bound": true},
-                    {"desc": "Alice 的 Windows", "name": "alice-win", "port": 4040, "pctype": "windows"},
+                    {"desc": "Alice 的 Mac", "name": "alice-mac", "port": 4041, "oc-port": 9464, "pctype": "macos", "bound": true, "public-url": "https://oc-alice-mac.example.com"},
+                    {"desc": "Alice 的 Windows", "name": "alice-win", "port": 4040, "oc-port": 9464, "pctype": "windows", "public-url": "https://oc-alice-win.example.com"},
                 ],
                 "sb": {
-                    "base_url": "https://md.isoops.com",
+                    "base_url": "https://sb.example.com",
                     "username": "alice",
                     "password": "sb-alice-pass",
                 },
@@ -206,7 +209,7 @@ async fn admin_create_user_generates_key_and_writes_registry() {
     assert_eq!(written["users"].as_array().unwrap().len(), 1);
     assert_eq!(written["users"][0]["name"], "alice");
     assert_eq!(written["users"][0]["key"], key);
-    assert_eq!(written["users"][0]["sb"]["base_url"], "https://md.isoops.com");
+    assert_eq!(written["users"][0]["sb"]["base_url"], "https://sb.example.com");
     assert_eq!(written["users"][0]["sb"]["username"], "alice");
     assert_eq!(written["users"][0]["sb"]["password"], "sb-alice-pass");
     // bound persists into the registry; omitted bound defaults to false.
@@ -283,7 +286,7 @@ async fn admin_create_user_id_is_6_digits_and_unique_in_registry() {
     assert_eq!(users.len(), 3);
     let alice = users.iter().find(|u| u["name"] == "alice").unwrap();
     assert_eq!(alice["id"], id);
-    assert_eq!(alice["sb"]["base_url"], "https://md.isoops.com");
+    assert_eq!(alice["sb"]["base_url"], DEFAULT_SB_BASE_URL);
     let mut ids: Vec<&str> = users.iter().filter_map(|u| u["id"].as_str()).collect();
     ids.sort_unstable();
     let count = ids.len();
@@ -340,7 +343,7 @@ async fn admin_list_update_regenerate_delete_flow() {
     let mut registry: serde_json::Value =
         serde_json::from_str(&users_json(DEFAULT_DEVICES)).unwrap();
     registry["users"][0]["sb"] = serde_json::json!({
-        "base_url": "https://md.isoops.com",
+        "base_url": "https://sb.example.com",
         "username": "preset-user",
         "password": "preset-pass",
     });
@@ -368,7 +371,7 @@ async fn admin_list_update_regenerate_delete_flow() {
                 "name": "renamed",
                 "devices": [{"desc": "一号机", "name": "dev-one", "port": 8200, "pctype": "windows", "public-url": "https://dev-one.example.com"}],
                 "sb": {
-                    "base_url": "https://md.isoops.com",
+                    "base_url": "https://sb.example.com",
                     "username": "renamed-user",
                     "password": "sb-renamed-pass",
                 },

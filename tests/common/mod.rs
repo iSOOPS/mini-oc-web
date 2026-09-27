@@ -67,9 +67,12 @@ pub fn cookie_key() -> Vec<u8> {
 }
 
 /// Default `public_url` baked into test device entries when a test doesn't
-/// supply its own — points at the loopback so `me`/`device_status` probes
-/// fail fast (connection refused) instead of egressing to the real fleet.
-pub const TEST_DEFAULT_PUBLIC_URL: &str = "http://127.0.0.1:65530";
+/// supply its own — a portless loopback literal (ports live in the `port` /
+/// `oc-port` fields, matching what `migrate_device_urls` normalizes to), so
+/// load() performs no migration write-back and `me`/`device_status` probes
+/// hit `http://127.0.0.1:{port}` and fail fast (connection refused) instead
+/// of egressing to the real fleet.
+pub const TEST_DEFAULT_PUBLIC_URL: &str = "http://127.0.0.1";
 
 /// The multi-tenant user registry document with a single default user
 /// (`tester`, key [`TEST_KEY`]) whose device list is `devices`. Every
@@ -155,7 +158,7 @@ pub fn users_json_with_public_urls(cloud_ip: &str, name_uris: &[(&str, &str)]) -
 /// client's auto-relogin).
 pub fn build_state(sb_base_url: &str) -> Arc<AppState> {
     let sb = Arc::new(SbClient::new(sb_base_url, SB_USER, SB_PASS).unwrap());
-    let users = Arc::new(UsersStore::new(sb.clone(), SB_USER));
+    let users = Arc::new(UsersStore::new(sb.clone()));
     let rate_limiter = Arc::new(RateLimiter::new(5, Duration::from_secs(600)));
     Arc::new(AppState {
         config: AppConfig {
@@ -253,12 +256,7 @@ pub async fn login_mounted(app: &Router) -> String {
         ),
     )
     .await;
-    assert_eq!(
-        resp.status(),
-        StatusCode::OK,
-        "login helper must succeed, got {}",
-        resp.status()
-    );
+    let status = resp.status();
     let set_cookie = resp
         .headers()
         .get(header::SET_COOKIE)
@@ -266,6 +264,12 @@ pub async fn login_mounted(app: &Router) -> String {
         .to_str()
         .unwrap()
         .to_string();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "login helper must succeed, got {}",
+        status
+    );
     set_cookie.split(';').next().unwrap().trim().to_string()
 }
 

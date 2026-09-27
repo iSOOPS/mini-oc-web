@@ -4,13 +4,13 @@ use mini_oc_web::jump::{append_auth_token, build_jump_url, pcname_b64};
 #[test]
 fn jump_url_ascii_path() {
     let url = build_jump_url(
-        "https://oc-mac.isoops.com",
+        "https://oc-mac.example.com",
         "/Users/samuel/projects/foo",
         "ses_abc123",
     );
     assert_eq!(
         url,
-        "https://oc-mac.isoops.com/L1VzZXJzL3NhbXVlbC9wcm9qZWN0cy9mb28/session/ses_abc123"
+        "https://oc-mac.example.com/L1VzZXJzL3NhbXVlbC9wcm9qZWN0cy9mb28/session/ses_abc123"
     );
 }
 
@@ -58,8 +58,8 @@ fn auth_token_skipped_for_empty_credentials() {
 
 #[test]
 fn jump_url_chinese_path_percent_encoded() {
-    let url = build_jump_url("https://oc-mac.isoops.com", "/Users/小明/学习", "ses_xyz");
-    assert!(url.starts_with("https://oc-mac.isoops.com/"));
+    let url = build_jump_url("https://oc-mac.example.com", "/Users/小明/学习", "ses_xyz");
+    assert!(url.starts_with("https://oc-mac.example.com/"));
     assert!(url.ends_with("/session/ses_xyz"));
     let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode("/Users/%E5%B0%8F%E6%98%8E/%E5%AD%A6%E4%B9%A0".as_bytes());

@@ -10,53 +10,6 @@ pub struct ProjectInfo {
     pub last_opened_at: Option<String>,
 }
 
-/// Wire format of `oc serve`'s `GET /project`: entries look like
-/// `{"id":"global","worktree":"/","time":{"created":1784163362673,
-/// "updated":1789219158527},"sandboxes":[]}`. The BFF re-projects this
-/// onto [`ProjectInfo`] (path = worktree, lastOpenedAt = time.updated)
-/// so the SPA keeps a stable shape.
-#[derive(Debug, Deserialize)]
-struct RawProject {
-    #[serde(default)]
-    id: Option<String>,
-    #[serde(default)]
-    worktree: Option<String>,
-    /// Legacy/alternate shape kept for compatibility with older mocks.
-    #[serde(default)]
-    path: Option<String>,
-    #[serde(default)]
-    time: Option<RawTime>,
-    #[serde(default, rename = "lastOpenedAt")]
-    last_opened_at: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawTime {
-    #[serde(default)]
-    updated: Option<i64>,
-}
-
-fn ms_to_rfc3339(ms: i64) -> Option<String> {
-    chrono::DateTime::from_timestamp_millis(ms).map(|d| d.to_rfc3339())
-}
-
-impl From<RawProject> for ProjectInfo {
-    fn from(r: RawProject) -> Self {
-        let path = r
-            .worktree
-            .or(r.path)
-            .or(r.id)
-            .unwrap_or_default();
-        let last_opened_at = r
-            .last_opened_at
-            .or_else(|| r.time.and_then(|t| t.updated).and_then(ms_to_rfc3339));
-        ProjectInfo {
-            path,
-            last_opened_at,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub id: String,
@@ -130,54 +83,6 @@ impl DeviceClient {
             password: password.into(),
             http,
         }
-    }
-
-    pub async fn health(&self) -> AppResult<bool> {
-        let url = format!("{}/health", self.base_url);
-        match self.http.get(&url).send().await {
-            Ok(r) => Ok(r.status().is_success()),
-            Err(_) => Ok(false),
-        }
-    }
-
-    async fn send_basic(&self, method: reqwest::Method, path: &str) -> AppResult<reqwest::Response> {
-        let url = format!("{}{}", self.base_url, path);
-        let resp = self
-            .http
-            .request(method, &url)
-            .basic_auth(&self.username, Some(&self.password))
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_connect() || e.is_timeout() || e.is_request() {
-                    AppError::DeviceOffline(format!("{} {}: {}", self.base_url, path, e))
-                } else {
-                    AppError::Internal(format!("device {} {}: {}", self.base_url, path, e))
-                }
-            })?;
-        let status = resp.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(AppError::DeviceAuthFailed(format!(
-                "{} returned {}",
-                self.base_url, status
-            )));
-        }
-        if !status.is_success() {
-            return Err(AppError::Internal(format!(
-                "{} returned {}",
-                self.base_url, status
-            )));
-        }
-        Ok(resp)
-    }
-
-    pub async fn projects(&self) -> AppResult<Vec<ProjectInfo>> {
-        let resp = self.send_basic(reqwest::Method::GET, "/project").await?;
-        let raw: Vec<RawProject> = resp
-            .json()
-            .await
-            .map_err(|e| AppError::Internal(format!("projects parse: {}", e)))?;
-        Ok(raw.into_iter().map(ProjectInfo::from).collect())
     }
 
     pub async fn create_session(&self, directory: &str, title: Option<&str>) -> AppResult<CreatedSession> {

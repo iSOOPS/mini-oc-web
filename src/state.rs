@@ -16,8 +16,8 @@ pub struct AppConfig {
     pub sb_password: String,
     pub cookie_key: Vec<u8>,
     /// The portal host the user reaches us on. Used to build deep-link
-    /// URLs of the form `{portal_base}/{b64pc}/...`. Defaults to
-    /// `https://oc.isoops.com`; override via `PORTAL_BASE`.
+    /// URLs of the form `{portal_base}/{b64pc}/...`. Defaults to the
+    /// local listener; set `PORTAL_BASE` to the public origin in prod.
     pub portal_base: String,
 }
 
@@ -57,12 +57,20 @@ impl AppState {
         let cookie_key = load_or_create_key(&cookie_key_path)?;
 
         let sb = Arc::new(SbClient::new(sb_base_url.clone(), sb_user.clone(), sb_password.clone())?);
-        sb.login().await?;
-        let users = Arc::new(UsersStore::new(sb.clone(), sb_user.clone()));
+        // Best-effort: SilverBullet must NOT be a hard startup dependency.
+        // SbClient re-logins transparently on the first 401 (see get_fs/put_fs),
+        // so a failed startup login self-heals on the first registry request.
+        if let Err(e) = sb.login().await {
+            tracing::warn!(
+                "silverbullet login failed at startup ({e}); \
+                 registry-backed endpoints return 503 until SB is reachable"
+            );
+        }
+        let users = Arc::new(UsersStore::new(sb.clone()));
         let rate_limiter = Arc::new(RateLimiter::new(5, Duration::from_secs(600)));
 
         let portal_base = std::env::var("PORTAL_BASE")
-            .unwrap_or_else(|_| "https://oc.isoops.com".into())
+            .unwrap_or_else(|_| format!("http://127.0.0.1:{web_port}"))
             .trim_end_matches('/')
             .to_string();
 

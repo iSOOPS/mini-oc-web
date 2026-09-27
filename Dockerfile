@@ -23,7 +23,7 @@ RUN cargo build --release
 # ---------- runtime ----------
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates wget && rm -rf /var/lib/apt/lists/*
+        ca-certificates telnet wget && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/mini-oc-web /usr/local/bin/mini-oc-web
 COPY --from=spa-builder /spa/dist /app/web

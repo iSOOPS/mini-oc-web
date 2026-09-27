@@ -2,7 +2,10 @@
   <div class="layout">
     <header v-if="auth.me" class="topbar">
       <div class="topbar-title">
-        <router-link to="/devices">mini-oc-web</router-link>
+        <router-link to="/devices" class="brand">
+          <AppLogo :size="22" />
+          <span>mini-oc-web</span>
+        </router-link>
       </div>
       <div class="topbar-actions">
         <button class="ghost topbar-btn" @click="settingsVisible = true">
@@ -23,6 +26,7 @@ import { ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from './store'
 import UserSettingsDialog from './components/UserSettingsDialog.vue'
+import AppLogo from './components/AppLogo.vue'
 
 const auth = useAuthStore()
 const router = useRouter()
@@ -57,6 +61,11 @@ async function onLogout() {
 }
 .topbar-title a {
   color: var(--text);
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 .topbar-actions {
   display: flex;

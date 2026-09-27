@@ -1071,7 +1071,7 @@ struct UserBody {
     /// 设备清单：每项 {d-name: 设备名称, name: 服务名, port: 端口}。
     devices: Vec<UserDevice>,
     /// SB存储配置分配（域名/账号/密码）：可选；None 时 create 落默认值
-    /// （域名 https://md.isoops.com、空凭据），update 保留原值。
+    /// （域名 https://sb.example.com、空凭据），update 保留原值。
     #[serde(default)]
     sb: Option<UserSbConfig>,
 }
@@ -1187,7 +1187,3 @@ async fn admin_users_delete(
     state.users.save(&uf).await?;
     Ok(AxumJson(serde_json::json!({"ok": true})))
 }
-
-// SPA fallback: when a request misses a static file, `ServeDir::fallback`
-// (`build_router`) serves `index.html` so vue-router history mode works on
-// refresh. See `build_router` for the wiring.

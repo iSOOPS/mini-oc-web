@@ -128,7 +128,7 @@ export interface UserDevice {
   status?: DeviceStatusInfo
 }
 
-/** 用户级 SB 连接配置：域名（默认 https://md.isoops.com）/账号/密码。 */
+/** 用户级 SB 连接配置：域名（默认 https://sb.example.com）/账号/密码。 */
 export interface SbConfig {
   base_url: string
   username: string

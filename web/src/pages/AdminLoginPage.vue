@@ -1,6 +1,7 @@
 <template>
   <div class="login-wrap">
     <div class="login-card">
+      <AppLogo class="logo" :size="56" />
       <h1 class="title">管理后台</h1>
       <p class="subtitle">mini-oc-web 多租户管理</p>
       <form @submit.prevent="onSubmit">
@@ -32,6 +33,7 @@
 import { ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAdminStore } from '../store'
+import AppLogo from '../components/AppLogo.vue'
 
 const admin = useAdminStore()
 const router = useRouter()
@@ -68,6 +70,9 @@ async function onSubmit() {
   border-radius: 12px;
   padding: 28px 22px;
   box-shadow: var(--shadow);
+}
+.logo {
+  margin: 0 auto 16px;
 }
 .title {
   margin: 0 0 4px;

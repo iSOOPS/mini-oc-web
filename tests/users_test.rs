@@ -19,7 +19,6 @@ async fn users_store_returns_empty_on_missing_document() {
     sb_get_404(&sb, USERS_PATH).await;
     let store = UsersStore::new(
         Arc::new(mini_oc_web::sb::SbClient::new(sb.uri(), SB_USER, SB_PASS).unwrap()),
-        SB_USER,
     );
 
     let uf = store.load().await.unwrap();
@@ -34,7 +33,6 @@ async fn users_store_load_parses_document() {
     sb_get(&sb, USERS_PATH, 200, &users_json(DEFAULT_DEVICES)).await;
     let store = UsersStore::new(
         Arc::new(mini_oc_web::sb::SbClient::new(sb.uri(), SB_USER, SB_PASS).unwrap()),
-        SB_USER,
     );
 
     let uf = store.load().await.unwrap();
@@ -51,7 +49,7 @@ async fn users_store_load_parses_document() {
             device_name: String::new(),
             pctype: "windows".into(),
             bound: false,
-            public_url: String::new(),
+            public_url: TEST_DEFAULT_PUBLIC_URL.to_string(),
         })
         .collect();
     assert_eq!(uf.users[0].devices, expected);
@@ -68,7 +66,6 @@ async fn users_store_save_writes_and_reload_reads_remote() {
     sb_put_204(&sb, USERS_PATH).await;
     let store = UsersStore::new(
         Arc::new(mini_oc_web::sb::SbClient::new(sb.uri(), SB_USER, SB_PASS).unwrap()),
-        SB_USER,
     );
 
     let mut uf = store.load().await.unwrap();
@@ -110,7 +107,6 @@ async fn users_store_every_load_hits_sb() {
         .await;
     let store = UsersStore::new(
         Arc::new(mini_oc_web::sb::SbClient::new(sb.uri(), SB_USER, SB_PASS).unwrap()),
-        SB_USER,
     );
 
     let uf = store.load().await.unwrap();
@@ -161,7 +157,6 @@ async fn legacy_uuid_registry_migrates_to_6_digit_ids() {
     sb_put_204(&sb, USERS_PATH).await;
     let store = UsersStore::new(
         Arc::new(mini_oc_web::sb::SbClient::new(sb.uri(), SB_USER, SB_PASS).unwrap()),
-        SB_USER,
     );
 
     let uf = store.load().await.unwrap();

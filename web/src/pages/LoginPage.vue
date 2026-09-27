@@ -1,6 +1,7 @@
 <template>
   <div class="login-wrap">
     <div class="login-card">
+      <AppLogo class="logo" :size="72" />
       <h1 class="title">mini-oc-web</h1>
       <p class="subtitle">跨设备 opencode 会话门户</p>
       <form @submit.prevent="onSubmit">
@@ -34,6 +35,7 @@
 import { ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '../store'
+import AppLogo from '../components/AppLogo.vue'
 
 const auth = useAuthStore()
 const router = useRouter()
@@ -70,6 +72,9 @@ async function onSubmit() {
   border-radius: 12px;
   padding: 28px 22px;
   box-shadow: var(--shadow);
+}
+.logo {
+  margin: 0 auto 16px;
 }
 .title {
   margin: 0 0 4px;

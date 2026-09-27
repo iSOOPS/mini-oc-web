@@ -356,7 +356,7 @@ async fn me_sb_updates_registry_with_validation() {
             Method::POST,
             "/api/me/sb",
             &serde_json::json!({
-                "base_url": "https://md.isoops.com",
+                "base_url": "https://sb.example.com",
                 "username": "samuel",
                 "password": "sb-secret"
             }),
@@ -367,7 +367,7 @@ async fn me_sb_updates_registry_with_validation() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await;
     assert_eq!(body["ok"], true);
-    assert_eq!(body["sb"]["base_url"], "https://md.isoops.com");
+    assert_eq!(body["sb"]["base_url"], "https://sb.example.com");
     assert_eq!(body["sb"]["username"], "samuel");
 
     // The written registry carries the sb block on the user entry.
@@ -381,11 +381,11 @@ async fn me_sb_updates_registry_with_validation() {
         .collect();
     assert_eq!(puts.len(), 2, "login stamp + sb save");
     let written: serde_json::Value = serde_json::from_slice(&puts[1].body).unwrap();
-    assert_eq!(written["users"][0]["sb"]["base_url"], "https://md.isoops.com");
+    assert_eq!(written["users"][0]["sb"]["base_url"], "https://sb.example.com");
     assert_eq!(written["users"][0]["sb"]["password"], "sb-secret");
 
     // Non-http scheme / whitespace / empty rejected.
-    for bad in ["", "ftp://md.isoops.com", "https://md.isoops.com/x y"] {
+    for bad in ["", "ftp://sb.example.com", "https://sb.example.com/x y"] {
         let resp = send(
             &app,
             json_req(
@@ -414,7 +414,7 @@ async fn me_sb_updates_registry_with_validation() {
             Method::POST,
             "/api/me/sb",
             &serde_json::json!({
-                "base_url": "https://md.isoops.com",
+                "base_url": "https://sb.example.com",
                 "username": "",
                 "password": ""
             }),
@@ -443,7 +443,7 @@ async fn user_info_by_key_returns_full_profile() {
                 "cloud_ip": "1.2.3.4",
                 "devices": [{"name": "dev-x", "port": 4040}],
                 "sb": {
-                    "base_url": "https://md.isoops.com",
+                    "base_url": "https://sb.example.com",
                     "username": "samuel",
                     "password": "sb-secret"
                 },
@@ -469,7 +469,7 @@ async fn user_info_by_key_returns_full_profile() {
     assert_eq!(body["cloud_ip"], "1.2.3.4");
     assert_eq!(body["devices"][0]["name"], "dev-x");
     assert_eq!(body["devices"][0]["port"], 4040);
-    assert_eq!(body["sb"]["base_url"], "https://md.isoops.com");
+    assert_eq!(body["sb"]["base_url"], "https://sb.example.com");
     assert_eq!(body["sb"]["username"], "samuel");
     assert_eq!(body["sb"]["password"], "sb-secret");
     assert_eq!(body["created_at"], "2026-09-13T00:00:00+08:00");

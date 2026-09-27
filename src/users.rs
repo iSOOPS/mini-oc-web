@@ -193,10 +193,13 @@ pub struct PortalUser {
 }
 
 /// Fleet-default cloud (rathole) server address for user device tunnels.
-pub const DEFAULT_CLOUD_IP: &str = "8.159.159.138";
+/// Loopback placeholder — every real deployment sets this per-user in the
+/// registry (or edits it from the settings page).
+pub const DEFAULT_CLOUD_IP: &str = "127.0.0.1";
 
-/// Fleet-default SilverBullet base URL for per-user SB configs.
-pub const DEFAULT_SB_BASE_URL: &str = "https://md.isoops.com";
+/// Fleet-default SilverBullet base URL for per-user SB configs. Matches
+/// the BFF's own `SB_BASE_URL` default; override per-user as needed.
+pub const DEFAULT_SB_BASE_URL: &str = "http://127.0.0.1:3000";
 
 /// Per-user SilverBullet connection config: 域名/账号/密码. Owned by the
 /// user (settings page), persisted inside the registry document. Legacy
@@ -204,7 +207,7 @@ pub const DEFAULT_SB_BASE_URL: &str = "https://md.isoops.com";
 /// (default domain, empty credentials).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UserSbConfig {
-    /// SB base URL, e.g. `https://md.isoops.com`. Must be http(s).
+    /// SB base URL, e.g. `https://sb.example.com`. Must be http(s).
     #[serde(default = "default_sb_base_url")]
     pub base_url: String,
     /// SB account name; empty = not configured yet.
@@ -503,16 +506,11 @@ pub fn validate_user_devices(devices: &[UserDevice]) -> AppResult<()> {
 /// outweighed its perf benefit.
 pub struct UsersStore {
     sb: Arc<SbClient>,
-    #[allow(dead_code)]
-    sb_user: String,
 }
 
 impl UsersStore {
-    pub fn new(sb: Arc<SbClient>, sb_user: impl Into<String>) -> Self {
-        Self {
-            sb,
-            sb_user: sb_user.into(),
-        }
+    pub fn new(sb: Arc<SbClient>) -> Self {
+        Self { sb }
     }
 
     /// Load `web/opencode/config.md`. A missing document is an empty
@@ -642,7 +640,7 @@ mod tests {
                         device_name: "SAMUEL-MBP".into(),
                         pctype: "macos".into(),
                         bound: true,
-                        public_url: "https://oc-mac.isoops.com".into(),
+                        public_url: "https://oc-mac.example.com".into(),
                     },
                     UserDevice {
                         desc: "Samuel 的 Windows".into(),
@@ -652,11 +650,11 @@ mod tests {
                         device_name: String::new(),
                         pctype: "windows".into(),
                         bound: false,
-                        public_url: "https://oc-win.isoops.com".into(),
+                        public_url: "https://oc-win.example.com".into(),
                     },
                 ],
                 sb: UserSbConfig {
-                    base_url: "https://md.isoops.com".into(),
+                    base_url: "https://sb.example.com".into(),
                     username: "samuel".into(),
                     password: "sb-secret".into(),
                 },
@@ -699,18 +697,18 @@ mod tests {
             username: username.into(),
             password: password.into(),
         };
-        assert!(validate_sb_config(&sb("https://md.isoops.com", "", "")).is_ok());
+        assert!(validate_sb_config(&sb("https://sb.example.com", "", "")).is_ok());
         assert!(validate_sb_config(&sb("http://127.0.0.1:3000", "u", "p")).is_ok());
         assert!(
             validate_sb_config(&sb("", "u", "p")).is_err(),
             "empty base_url rejected"
         );
         assert!(
-            validate_sb_config(&sb("ftp://md.isoops.com", "u", "p")).is_err(),
+            validate_sb_config(&sb("ftp://sb.example.com", "u", "p")).is_err(),
             "non-http scheme rejected"
         );
         assert!(
-            validate_sb_config(&sb("https://md.isoops.com/x y", "u", "p")).is_err(),
+            validate_sb_config(&sb("https://sb.example.com/x y", "u", "p")).is_err(),
             "whitespace rejected"
         );
         assert!(
@@ -718,11 +716,11 @@ mod tests {
             "overlong base_url rejected"
         );
         assert!(
-            validate_sb_config(&sb("https://md.isoops.com", &"u".repeat(65), "p")).is_err(),
+            validate_sb_config(&sb("https://sb.example.com", &"u".repeat(65), "p")).is_err(),
             "overlong username rejected"
         );
         assert!(
-            validate_sb_config(&sb("https://md.isoops.com", "u", &"p".repeat(129))).is_err(),
+            validate_sb_config(&sb("https://sb.example.com", "u", &"p".repeat(129))).is_err(),
             "overlong password rejected"
         );
     }
@@ -863,7 +861,7 @@ mod tests {
             "http://host accepted"
         );
         let mut https_ok = ok("a", "a", 1);
-        https_ok.public_url = "https://oc-mac.isoops.com".into();
+        https_ok.public_url = "https://oc-mac.example.com".into();
         assert!(
             validate_user_devices(&[https_ok]).is_ok(),
             "https://host accepted"
@@ -965,10 +963,9 @@ mod store_tests {
             .expect(2)
             .mount(&sb)
             .await;
-        let store = UsersStore::new(
-            std::sync::Arc::new(crate::sb::SbClient::new(sb.uri(), "admin", "pw").unwrap()),
-            "admin",
-        );
+        let store = UsersStore::new(std::sync::Arc::new(
+            crate::sb::SbClient::new(sb.uri(), "admin", "pw").unwrap(),
+        ));
         // First call
         let _ = store.load().await.unwrap();
         // Second call — must hit SB again (no cache)

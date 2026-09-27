@@ -59,7 +59,7 @@
         <form @submit.prevent="saveSb">
           <label>
             <span class="lbl">域名</span>
-            <input v-model.trim="sbUrlDraft" type="text" maxlength="200" placeholder="https://md.isoops.com" />
+            <input v-model.trim="sbUrlDraft" type="text" maxlength="200" placeholder="https://sb.example.com" />
           </label>
           <label>
             <span class="lbl">账号</span>
@@ -211,7 +211,7 @@ watch(
     error.value = ''
     notice.value = ''
     nameDraft.value = me.value?.name ?? ''
-    sbUrlDraft.value = me.value?.sb?.base_url ?? 'https://md.isoops.com'
+    sbUrlDraft.value = me.value?.sb?.base_url ?? 'http://127.0.0.1:3000'
     sbUserDraft.value = me.value?.sb?.username ?? ''
     sbPassDraft.value = me.value?.sb?.password ?? ''
     keyRevealed.value = false
