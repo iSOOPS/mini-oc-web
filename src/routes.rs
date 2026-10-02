@@ -301,16 +301,33 @@ fn device_credentials(user: &PortalUser) -> (String, String) {
 
 /// Base URL of the device's local TUI service (mini-oc-gui): the tunnel
 /// address plus the 服务端口号 — `/status`, `/project`, `/api/session`
-/// all live here. Callers must ensure `public_url` is non-empty first.
+/// all live here. When `public_url` carries its own explicit port
+/// (`scheme://host:port`), it IS the access endpoint and is used as-is.
+/// Callers must ensure `public_url` is non-empty first.
 fn tui_base_url(ud: &UserDevice) -> String {
-    format!("{}:{}", ud.public_url.trim_end_matches('/'), ud.port)
+    let base = ud.public_url.trim_end_matches('/');
+    let has_own_port = url::Url::parse(base)
+        .map(|u| u.port().is_some())
+        .unwrap_or(false);
+    if has_own_port {
+        base.to_string()
+    } else {
+        format!("{}:{}", base, ud.port)
+    }
 }
 
-/// Base URL of the device's opencode server (web UI + native API): the
-/// tunnel address plus the OpenCode 端口号. Browser deep links are built
-/// on this. Callers must ensure `public_url` is non-empty first.
+/// Base URL of the device's opencode server (web UI + native API).
+/// Browser deep links are built on this: the tunnel address with the
+/// OpenCode 端口号 appended as a path prefix (`{public_url}/{oc_port}`)
+/// for path-based reverse-proxy dispatch; when `oc-port` is unset the
+/// jump URL is the bare tunnel address — no extra segment.
+/// Callers must ensure `public_url` is non-empty first.
 fn oc_base_url(ud: &UserDevice) -> String {
-    format!("{}:{}", ud.public_url.trim_end_matches('/'), ud.oc_port)
+    let base = ud.public_url.trim_end_matches('/');
+    match ud.oc_port {
+        Some(oc_port) => format!("{}/{}", base, oc_port),
+        None => base.to_string(),
+    }
 }
 
 async fn healthz() -> impl IntoResponse {
@@ -374,7 +391,8 @@ async fn login(
 /// admin-assigned tunnel address and 服务端口号: `GET
 /// {public_url}:{port}/status` (see [`tui_base_url`]; the same URL base
 /// serves `/project` and `/api/session`). Browser deep links use the
-/// OpenCode 端口号 instead: `{public_url}:{oc_port}/...`.
+/// OpenCode 端口号 as a path prefix instead: `{public_url}/{oc_port}/...`
+/// (or the bare `{public_url}` when `oc-port` is unset).
 ///
 /// Each device entry carries three independent runtime signals so the SPA
 /// can render them separately:

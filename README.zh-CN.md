@@ -82,11 +82,12 @@ SilverBullet 中的 `web/opencode/config.md` 持有一份 `users.json` 形状的
 
 - 用户使用 `name + key` 登录（key 同时也是跳转到设备的凭据）。
 - 设备是"授权项"：管理员分配隧道服务名 + 端口；设备之后通过 `POST /api/device-bind` 自行绑定（写入 `device-name`，把 `bound` 翻转为 true）。
+- `public-url` 是设备穿透地址 `http(s)://host[:port]` —— 允许自带端口（`ip:port` 隧道端点），带端口时直接按该地址访问。`oc-port` 可空：非空时浏览器跳转 URL 以路径前缀拼接（`{public-url}/{oc-port}/…`），为空时跳转地址即穿透地址本身。
 - 不做缓存：每个请求都直接从 SilverBullet 读取注册表 —— 用户量小，TTL 缓存（以及它带来的陈旧性 bug）不值得（ADR #20/#21）。
 
 ### 4. 设备状态：一次往返 —— `/api/me`
 
-`GET /api/me` 返回用户的设备列表，**并附带运行时状态**：BFF 并发探测每台设备的 `{cloud_ip}:{port}/status`（每台 4 秒超时，`futures::join_all`，分批执行）。探测永远不会导致请求失败 —— 掉线的设备只会以 `online:false, reason:"…"` 的形式返回，SPA 依据 `available ∈ {-1, 0, 1}` 渲染红/橙/绿状态点。
+`GET /api/me` 返回用户的设备列表，**并附带运行时状态**：BFF 并发探测每台设备的 TUI 服务地址（每台 4 秒超时，`futures::join_all`，分批执行）—— 无端口穿透地址拼 `{public-url}:{port}/status`，自带端口的直接用 `{public-url}`。探测永远不会导致请求失败 —— 掉线的设备只会以 `online:false, reason:"…"` 的形式返回，SPA 依据 `available ∈ {-1, 0, 1}` 渲染红/橙/绿状态点。
 
 ### 5. 深链跳转 URL（base64url，覆盖优先级）
 
@@ -95,9 +96,10 @@ SilverBullet 中的 `web/opencode/config.md` 持有一份 `users.json` 形状的
 ```
 
 - `directory` 以无填充的 URL-safe base64 编码，保证中文、带空格的路径在每一跳都安然无恙；该格式由单元测试锁定（`jump.rs`，零依赖）。
-- `base_url` 优先级：设备级覆盖 > 用户配置 > 注册表 `public-url`。
-  覆盖值只改变**浏览器**跳转的目标地址；BFF 数据面永远走 `cloud_ip:port`
-  （服务器够不到用户的局域网）。
+- `base_url` 优先级：设备级覆盖 > 用户配置 > 注册表 `public-url`
+  按 `{public-url}[/{oc-port}]` 组合（路径前缀；`oc-port` 为空时省略该段）。
+  覆盖值只改变**浏览器**跳转的目标地址；BFF 数据面永远走设备的 TUI
+  穿透地址（服务器够不到用户的局域网）。
 - `auth_token`（`user:pass` 的 base64）只附加在局域网回退链接上，让用户免去浏览器原生 Basic 认证弹窗。
 - 防开放重定向：跳转目标必须来自注册表/配置的并集 —— 任意 URL 一律拒绝。
 

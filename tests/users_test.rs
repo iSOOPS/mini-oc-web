@@ -45,7 +45,7 @@ async fn users_store_load_parses_document() {
             desc: d.to_string(),
             name: d.to_string(),
             port: 4040,
-            oc_port: 9464,
+            oc_port: None,
             device_name: String::new(),
             pctype: "windows".into(),
             bound: false,

@@ -25,8 +25,9 @@ const KEY_LEN: usize = 32;
 /// port (mini-oc-gui), the opencode server port the TUI launches, the
 /// device name written by the binding client, the platform type, the
 /// binding status, and the device's tunnel address (`public_url` —
-/// admin-assigned `scheme://host` with NO port: the BFF reaches the TUI
-/// at `{public_url}:{port}` and opencode at `{public_url}:{oc_port}`).
+/// admin-assigned `scheme://host[:port]`: the BFF reaches the TUI at
+/// `{public_url}` (or `{public_url host}:{port}` when portless) and
+/// builds opencode jump URLs as `{public_url}[/{oc_port}]`).
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct UserDevice {
     /// Human-readable description (描述), display-only; 1-64 chars
@@ -39,15 +40,21 @@ pub struct UserDevice {
     /// (`^[a-z0-9-]{1,64}$`) — it becomes path/URL material.
     pub name: String,
     /// 服务端口号：the local TUI service port (mini-oc-gui, device
-    /// default 9465). The BFF probes `{public_url}:{port}/status` and
-    /// targets `{public_url}:{port}` for the TUI's `/project`,
-    /// `/api/session` endpoints.
+    /// default 9465). The BFF probes `{public_url host}:{port}/status`
+    /// and targets it for the TUI's `/project`, `/api/session`
+    /// endpoints — unless `public_url` already carries its own port.
     pub port: u16,
     /// OpenCode 端口号：the port the TUI launches `opencode serve` on
-    /// (device default 9464). The BFF builds browser jump URLs as
-    /// `{public_url}:{oc_port}/...`. Must differ from `port`.
-    #[serde(rename = "oc-port", default = "default_oc_port")]
-    pub oc_port: u16,
+    /// (device default 9464). When set, browser jump URLs are built as
+    /// `{public_url}/{oc_port}/...` (path prefix); when empty (null /
+    /// missing) the jump URL is the bare `{public_url}` — no extra
+    /// segment. Must differ from `port` when set.
+    #[serde(
+        rename = "oc-port",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub oc_port: Option<u16>,
     /// 设备名称（device-name）：由设备客户端绑定时（POST
     /// /api/device-bind）自动写入；管理端不可编辑。Empty = not yet
     /// written by a binding client.
@@ -63,21 +70,15 @@ pub struct UserDevice {
     #[serde(default)]
     pub bound: bool,
     /// 设备穿透地址（tunnel address）, admin-assigned as a bare
-    /// `scheme://host` (IP or domain, http/https — NO port, NO path).
-    /// The BFF reaches the TUI at `{public_url}:{port}` and opencode at
-    /// `{public_url}:{oc_port}`. Empty (legacy registry entries only —
+    /// `scheme://host[:port]` (IP or domain, http/https — optional
+    /// explicit port, NO path). The BFF reaches the TUI at
+    /// `{public_url}` when it carries its own port, otherwise at
+    /// `{public_url}:{port}`; opencode jump URLs append `/{oc_port}`
+    /// when that field is set. Empty (legacy registry entries only —
     /// new writes are validated non-empty) means the device cannot be
     /// probed and is reported offline with a "not configured" reason.
     #[serde(rename = "public-url", default)]
     pub public_url: String,
-}
-
-/// Default opencode server port — mirrors mini-oc-gui's
-/// `DEFAULT_OPENCODE_PORT` (its TUI launches `opencode serve --port
-/// 9464`). Legacy registry entries without an explicit `oc-port`
-/// deserialize with this value.
-fn default_oc_port() -> u16 {
-    9464
 }
 
 /// Platform types a device entry may declare (mirrors the SB path-list
@@ -112,8 +113,8 @@ impl<'de> Deserialize<'de> for UserDevice {
                 name: String,
                 #[serde(default = "legacy_default_port")]
                 port: u16,
-                #[serde(rename = "oc-port", default = "default_oc_port")]
-                oc_port: u16,
+                #[serde(rename = "oc-port", default)]
+                oc_port: Option<u16>,
                 #[serde(rename = "device-name", default)]
                 device_name: String,
                 #[serde(rename = "pctype", default)]
@@ -153,7 +154,7 @@ impl<'de> Deserialize<'de> for UserDevice {
                 desc: String::new(),
                 name,
                 port: LEGACY_DEFAULT_PORT,
-                oc_port: default_oc_port(),
+                oc_port: None,
                 device_name: String::new(),
                 pctype: String::new(),
                 bound: false,
@@ -337,36 +338,6 @@ fn migrate_legacy_ids(uf: &mut UsersFile) -> bool {
     changed
 }
 
-/// Strip any explicit `:port` from legacy `public-url` values — the port
-/// now lives in the dedicated `port` (TUI) / `oc-port` (opencode) fields,
-/// so a legacy `http://host:9464` becomes `http://host` and both composed
-/// addresses derive from the fields. Returns whether anything changed.
-/// Unparseable values are left untouched for write-time validation.
-fn migrate_device_urls(uf: &mut UsersFile) -> bool {
-    let mut changed = false;
-    for u in &mut uf.users {
-        for d in &mut u.devices {
-            let Ok(mut parsed) = url::Url::parse(d.public_url.trim()) else {
-                continue;
-            };
-            if parsed.port().is_some() {
-                let _ = parsed.set_port(None);
-                parsed.set_path("");
-                let stripped = parsed.as_str().trim_end_matches('/').to_string();
-                tracing::info!(
-                    "migrating device {} public-url {} -> {} (port moved to port/oc-port fields)",
-                    d.name,
-                    d.public_url,
-                    stripped
-                );
-                d.public_url = stripped;
-                changed = true;
-            }
-        }
-    }
-    changed
-}
-
 /// Portal user names follow the device-name whitelist so they stay
 /// path/URL-safe wherever we print them. Whitelist:
 /// `[A-Za-z0-9_-]{1,64}` (mirrors the device-side whitelist in
@@ -445,23 +416,24 @@ pub fn validate_user_devices(devices: &[UserDevice]) -> AppResult<()> {
                 d.name
             )));
         }
-        if d.oc_port == 0 {
-            return Err(AppError::InvalidTarget(format!(
-                "bad oc-port for {}: must be 1-65535",
-                d.name
-            )));
+        if let Some(oc) = d.oc_port {
+            if oc == 0 {
+                return Err(AppError::InvalidTarget(format!(
+                    "bad oc-port for {}: must be 1-65535",
+                    d.name
+                )));
+            }
+            if oc == d.port {
+                return Err(AppError::InvalidTarget(format!(
+                    "bad oc-port for {}: must differ from the TUI service port {} \
+                     (the device TUI rejects equal ports too)",
+                    d.name, d.port
+                )));
+            }
         }
-        if d.oc_port == d.port {
-            return Err(AppError::InvalidTarget(format!(
-                "bad oc-port for {}: must differ from the TUI service port {} \
-                 (the device TUI rejects equal ports too)",
-                d.name, d.port
-            )));
-        }
-        // public_url: a bare tunnel address `http(s)://host` — IP or
-        // domain, NO port (ports come from `port` / `oc-port`), NO path.
-        // The BFF composes every device URL from it, so bad input is
-        // caught here at write time.
+        // public_url: a bare tunnel address `http(s)://host[:port]` — IP or
+        // domain, optional explicit port, NO path. The BFF composes every
+        // device URL from it, so bad input is caught here at write time.
         let url = d.public_url.trim();
         if url.is_empty() {
             return Err(AppError::InvalidTarget(format!(
@@ -474,12 +446,11 @@ pub fn validate_user_devices(devices: &[UserDevice]) -> AppResult<()> {
                 if (u.scheme() == "http" || u.scheme() == "https")
                     && u.host_str().is_some()
                     && !u.host_str().unwrap_or("").is_empty()
-                    && u.port().is_none()
                     && (u.path() == "/" || u.path().is_empty()) => {}
             Ok(u) => {
                 return Err(AppError::InvalidTarget(format!(
-                    "bad public-url for {}: {} (must be http(s)://host — \
-                     IP or domain, no port, no path)",
+                    "bad public-url for {}: {} (must be http(s)://host[:port] — \
+                     IP or domain, no path)",
                     d.name, u
                 )));
             }
@@ -524,8 +495,7 @@ impl UsersStore {
         };
         let mut uf: UsersFile = serde_json::from_str(&body)
             .map_err(|e| AppError::Internal(format!("users config parse: {}", e)))?;
-        let mut changed = migrate_legacy_ids(&mut uf);
-        changed |= migrate_device_urls(&mut uf);
+        let changed = migrate_legacy_ids(&mut uf);
         if changed {
             let body = serialize_users_file(&uf)?;
             self.sb.put_fs(USERS_PATH, &body).await?;
@@ -636,7 +606,7 @@ mod tests {
                         desc: "Samuel 的 MacBook".into(),
                         name: "samuel-mac".into(),
                         port: 9464,
-                        oc_port: 18800,
+                        oc_port: Some(18800),
                         device_name: "SAMUEL-MBP".into(),
                         pctype: "macos".into(),
                         bound: true,
@@ -646,7 +616,7 @@ mod tests {
                         desc: "Samuel 的 Windows".into(),
                         name: "samuel-win".into(),
                         port: 4040,
-                        oc_port: 9464,
+                        oc_port: Some(9464),
                         device_name: String::new(),
                         pctype: "windows".into(),
                         bound: false,
@@ -731,7 +701,7 @@ mod tests {
             desc: desc.into(),
             name: name.into(),
             port,
-            oc_port: 9464,
+            oc_port: Some(9464),
             device_name: String::new(),
             pctype: "windows".into(),
             bound: false,
@@ -846,13 +816,19 @@ mod tests {
             validate_user_devices(&[no_host]).is_err(),
             "public-url without host rejected"
         );
-        // public-url is a bare tunnel address: ports are rejected — they
-        // live in the dedicated `port` / `oc-port` fields.
+        // public-url may carry its own explicit port (`ip:port` tunnel
+        // endpoints): it is the access address as-is.
         let mut with_port = ok("a", "a", 1);
         with_port.public_url = "http://10.0.0.1:9464".into();
         assert!(
-            validate_user_devices(&[with_port]).is_err(),
-            "public-url with port rejected"
+            validate_user_devices(&[with_port]).is_ok(),
+            "public-url with explicit port accepted"
+        );
+        let mut with_port_v6 = ok("a", "a", 1);
+        with_port_v6.public_url = "http://[::1]:9464".into();
+        assert!(
+            validate_user_devices(&[with_port_v6]).is_ok(),
+            "public-url with IPv6 literal + port accepted"
         );
         let mut http_ok = ok("a", "a", 1);
         http_ok.public_url = "http://10.0.0.1".into();
@@ -866,16 +842,46 @@ mod tests {
             validate_user_devices(&[https_ok]).is_ok(),
             "https://host accepted"
         );
-        // oc-port: 0 rejected; equal to the TUI service port rejected
-        // (mirrors the device TUI's own submit_settings rule).
+        // Domain forms beyond plain ASCII labels are valid tunnel hosts:
+        // the BFF contract is only "http(s)://host, no port, no path" —
+        // underscore labels, non-ASCII (IDNA→punycode) and IPv6 literals
+        // must not be rejected here (the admin UI regex used to
+        // over-restrict them client-side).
+        let mut underscore = ok("a", "a", 1);
+        underscore.public_url = "https://my_host.example.com".into();
+        assert!(
+            validate_user_devices(&[underscore]).is_ok(),
+            "underscore host label accepted"
+        );
+        let mut unicode = ok("a", "a", 1);
+        unicode.public_url = "https://例子.com".into();
+        assert!(
+            validate_user_devices(&[unicode]).is_ok(),
+            "non-ASCII (IDNA) domain accepted"
+        );
+        let mut ipv6 = ok("a", "a", 1);
+        ipv6.public_url = "http://[::1]".into();
+        assert!(
+            validate_user_devices(&[ipv6]).is_ok(),
+            "bracketed IPv6 literal accepted"
+        );
+        // oc-port: optional — None means the jump URL carries no extra
+        // segment; Some(0) rejected; Some(p) equal to the TUI service
+        // port rejected (mirrors the device TUI's own rule).
+        let mut oc_none = ok("a", "a", 1);
+        oc_none.oc_port = None;
+        assert!(
+            validate_user_devices(&[oc_none]).is_ok(),
+            "oc-port unset accepted"
+        );
         let mut oc_zero = ok("a", "a", 1);
-        oc_zero.oc_port = 0;
+        oc_zero.oc_port = Some(0);
         assert!(
             validate_user_devices(&[oc_zero]).is_err(),
             "oc-port 0 rejected"
         );
         let mut oc_same = ok("a", "a", 9464);
-        oc_same.oc_port = 9464;
+        oc_same.oc_port = Some(9464);
         assert!(
             validate_user_devices(&[oc_same]).is_err(),
             "oc-port equal to service port rejected"
@@ -912,7 +918,7 @@ mod tests {
                 desc: desc.into(),
                 name: name.into(),
                 port,
-                oc_port: 9464,
+                oc_port: None,
                 device_name: device_name.into(),
                 pctype: pctype.into(),
                 bound,

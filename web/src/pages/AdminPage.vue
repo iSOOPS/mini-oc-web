@@ -204,7 +204,7 @@
                   <input
                     v-model.number="d.ocPort"
                     type="number"
-                    placeholder="TUI 启动 oc server 的端口，如 9464"
+                    placeholder="可空；填写后以 /端口号 路径前缀拼接跳转地址"
                     min="1"
                     max="65535"
                   />
@@ -219,7 +219,7 @@
                     <input
                       v-model.trim="d.publicHost"
                       type="text"
-                      placeholder="IP 或域名（不含端口）"
+                      placeholder="IP 或域名，可粘贴含协议完整地址"
                       maxlength="200"
                       autocomplete="off"
                     />
@@ -258,7 +258,7 @@
               + 添加设备
             </button>
             <span class="muted helper">
-              每台设备包含：描述（展示用，1-64 字符）、服务名称（仅限小写字母、数字、连字符，不可重复）、平台类型（windows/macos）、服务端口号（本地 TUI 服务端口，1-65535）、OpenCode 端口号（TUI 启动 oc server 的端口，须与服务端口号不同）、设备穿透地址（IP 或域名 + http/https，不含端口：BFF 以 穿透地址+服务端口号 探活/调 TUI 接口，以 穿透地址+OpenCode 端口号 跳转 oc web）、设备名称（只读）与绑定状态（均由客户端绑定时自动写入/更新，不可人工修改）；「复制」会克隆一份当前设备配置，保存时服务名称不可与其他设备重复。
+              每台设备包含：描述（展示用，1-64 字符）、服务名称（仅限小写字母、数字、连字符，不可重复）、平台类型（windows/macos）、服务端口号（本地 TUI 服务端口，1-65535；穿透地址不带端口时，BFF 以 穿透地址+服务端口号 探活/调 TUI 接口）、OpenCode 端口号（可空；非空时跳转 oc web 以 穿透地址/OpenCode端口号 路径前缀拼接，为空时跳转地址即穿透地址本身）、设备穿透地址（IP 或域名，可自带端口如 1.2.3.4:9000，支持 IPv6 与下划线/中文等非常规域名；可直接粘贴含协议的完整地址，保存时自动去除协议与路径；地址自带端口时 BFF 直接以该地址探活）、设备名称（只读）与绑定状态（均由客户端绑定时自动写入/更新，不可人工修改）；「复制」会克隆一份当前设备配置，保存时服务名称不可与其他设备重复。
             </span>
           </section>
           <p v-if="formError" class="error">{{ formError }}</p>
@@ -401,10 +401,10 @@ const formName = ref('')
 const formError = ref('')
 const submitting = ref(false)
 
-/** 表单内一行设备的草稿状态：port / ocPort 为 '' 表示尚未输入；
- *  deviceName（设备名称）只读，由绑定客户端写入，提交时原样透传；
- *  publicScheme + publicHost 组成设备穿透地址（提交时拼为
- *  scheme://host，不含端口——端口由 port / ocPort 字段承载）。 */
+/** 表单内一行设备的草稿状态：port / ocPort 为 '' 表示尚未输入
+ *  （ocPort 允许留空 = 跳转地址不含 /oc-port 段）；deviceName（设备
+ *  名称）只读，由绑定客户端写入，提交时原样透传；publicScheme +
+ *  publicHost 组成设备穿透地址（host 段可自带端口）。 */
 interface FormDevice {
   desc: string
   name: string
@@ -432,7 +432,7 @@ function emptyDeviceRow(): FormDevice {
     desc: '',
     name: '',
     port: '',
-    ocPort: 9464,
+    ocPort: '',
     pctype: 'windows',
     publicScheme: 'https',
     publicHost: '',
@@ -461,8 +461,52 @@ function duplicateDeviceRow(i: number) {
 const NAME_RE = /^[A-Za-z0-9_-]{1,64}$/
 /** 设备服务名称：全小写英文/数字/连字符，禁止其他特殊符号。 */
 const DEVICE_NAME_RE = /^[a-z0-9-]{1,64}$/
-/** 设备穿透地址主机部分：IP（v4）或域名，不含协议与端口。 */
-const PUBLIC_HOST_RE = /^(\d{1,3}(\.\d{1,3}){3}|[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*)$/
+
+/** 设备穿透地址主机部分：宽松校验 —— 允许 `host`、`host:port`、
+ *  `[IPv6]`、`[IPv6]:port`。host 段只拒绝会破坏 URL 拼接的字符
+ *  （空白、路径/查询/锚点起始符、userinfo、方括号、WHATWG 禁用符号、
+ *  控制字符）；域名（含下划线、非 ASCII 等非常规形态）均放行，与后端
+ *  `validate_user_devices` 的实际契约对齐。端口段须为 1-65535。 */
+const HOST_FORBIDDEN_RE = /[\s:\/?#\\@[\]<>^|%\u0000-\u001f\u007f]/
+const IPV6_LITERAL_RE = /^\[[0-9A-Fa-f:.]+\]$/
+const PORT_RE = /^[0-9]{1,5}$/
+
+function validPortSuffix(s: string): boolean {
+  if (!PORT_RE.test(s)) return false
+  const n = Number(s)
+  return n >= 1 && n <= 65535
+}
+
+function validTunnelHost(s: string): boolean {
+  if (s === '') return false
+  if (s.startsWith('[')) {
+    const close = s.indexOf(']')
+    if (close === -1) return false
+    if (!IPV6_LITERAL_RE.test(s.slice(0, close + 1))) return false
+    const tail = s.slice(close + 1)
+    return tail === '' || (tail.startsWith(':') && validPortSuffix(tail.slice(1)))
+  }
+  const colon = s.lastIndexOf(':')
+  if (colon === -1) return !HOST_FORBIDDEN_RE.test(s)
+  const host = s.slice(0, colon)
+  const port = s.slice(colon + 1)
+  return host !== '' && !HOST_FORBIDDEN_RE.test(host) && validPortSuffix(port)
+}
+
+/** 粘贴归一化：用户常把穿透服务商给的完整地址粘进主机框，这里剥掉
+ *  协议前缀（并入协议下拉）与尾部路径/斜杠，其余（含 `host:port`）
+ *  原样保留 —— 地址自带端口是合法形态。 */
+function peelTunnelInput(d: FormDevice): void {
+  let s = d.publicHost.trim()
+  const scheme = /^(https?):\/\//i.exec(s)
+  if (scheme) {
+    d.publicScheme = scheme[1].toLowerCase()
+    s = s.slice(scheme[0].length)
+  }
+  const cut = s.search(/[/?#]/)
+  if (cut >= 0) s = s.slice(0, cut)
+  d.publicHost = s.trim()
+}
 
 /** 设备清单展示：`办公 Mac（dev-a:4040）`。描述为空时退回服务名。 */
 function fmtDevices(u: PortalUser): string {
@@ -477,7 +521,7 @@ function toUserDevices(): UserDevice[] {
       desc: d.desc,
       name: d.name,
       port: Number(d.port),
-      'oc-port': Number(d.ocPort),
+      'oc-port': d.ocPort === '' || d.ocPort === null ? null : Number(d.ocPort),
       'device-name': d.deviceName,
       pctype: d.pctype,
       bound: d.bound,
@@ -496,6 +540,7 @@ function validate(): string {
   for (let i = 0; i < devices.length; i++) {
     const d = devices[i]
     if (d.desc === '' && d.name === '' && d.port === '') continue
+    peelTunnelInput(d)
     if (!d.desc) {
       return `第 ${i + 1} 行描述不能为空。`
     }
@@ -512,15 +557,18 @@ function validate(): string {
     if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) {
       return `第 ${i + 1} 行（${d.desc}）的服务端口号必须是 1-65535 的整数。`
     }
-    const ocPortNum = Number(d.ocPort)
-    if (!Number.isInteger(ocPortNum) || ocPortNum < 1 || ocPortNum > 65535) {
-      return `第 ${i + 1} 行（${d.desc}）的 OpenCode 端口号必须是 1-65535 的整数。`
+    const ocPortRaw = d.ocPort === null || d.ocPort === undefined ? '' : String(d.ocPort)
+    if (ocPortRaw !== '') {
+      const ocPortNum = Number(ocPortRaw)
+      if (!Number.isInteger(ocPortNum) || ocPortNum < 1 || ocPortNum > 65535) {
+        return `第 ${i + 1} 行（${d.desc}）的 OpenCode 端口号必须是 1-65535 的整数（留空表示跳转地址不含该段）。`
+      }
+      if (ocPortNum === portNum) {
+        return `第 ${i + 1} 行（${d.desc}）的 OpenCode 端口号须与服务端口号不同（设备端 TUI 拒绝相同端口）。`
+      }
     }
-    if (ocPortNum === portNum) {
-      return `第 ${i + 1} 行（${d.desc}）的 OpenCode 端口号须与服务端口号不同（设备端 TUI 拒绝相同端口）。`
-    }
-    if (!PUBLIC_HOST_RE.test(d.publicHost)) {
-      return `第 ${i + 1} 行（${d.desc}）的设备穿透地址「${d.publicHost}」不合法：仅限 IP 或域名，不含端口与路径。`
+    if (!validTunnelHost(d.publicHost)) {
+      return `第 ${i + 1} 行（${d.desc}）的设备穿透地址「${d.publicHost}」不合法：请填写 IP 或域名，可带端口（如 1.2.3.4:9000），也可直接粘贴含协议的完整地址（自动去除协议与路径）。`
     }
     const prev = seen.get(d.name)
     if (prev !== undefined) {
@@ -550,12 +598,13 @@ function openCreate() {
   dialogMode.value = 'create'
 }
 
-/** 把存储的 public-url（scheme://host，后端迁移已剥端口）拆成表单的
- * scheme + host；带端口的旧值在此再剥一次以防迁移未跑。 */
+/** 把存储的 public-url（scheme://host[:port]）拆成表单的 scheme +
+ *  host；host 段可自带端口。IPv6 字面量含冒号，按方括号整体捕获，
+ *  其后可跟 :port。 */
 function splitPublicUrl(url: string): { scheme: string; host: string } {
-  const m = /^(https?):\/\/([^/:?#]+)/.exec(url.trim())
+  const m = /^(https?):\/\/(\[[0-9A-Fa-f:.]+\](?::\d{1,5})?|[^/?#@]+)/i.exec(url.trim())
   if (!m) return { scheme: 'https', host: '' }
-  return { scheme: m[1], host: m[2] }
+  return { scheme: m[1].toLowerCase(), host: m[2] }
 }
 
 function openEdit(u: PortalUser) {
@@ -567,7 +616,7 @@ function openEdit(u: PortalUser) {
       desc: d.desc ?? '',
       name: d.name,
       port: d.port,
-      ocPort: d['oc-port'] ?? 9464,
+      ocPort: d['oc-port'] ?? '',
       pctype: d.pctype || 'windows',
       publicScheme: scheme,
       publicHost: host,

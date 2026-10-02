@@ -90,8 +90,11 @@ export interface UserDevice {
   /** 设备服务名称（路径/URL 材料）。 */
   name: string
   port: number
-  /** OpenCode 端口号：TUI 启动 oc server 的端口（默认 9464；跳转 oc web 用）。 */
-  'oc-port'?: number
+  /**
+   * OpenCode 端口号：可空。非空时跳转 oc web 以路径前缀 `/{oc-port}`
+   * 拼接；为空（null/缺省）时跳转地址即穿透地址本身、不含额外段。
+   */
+  'oc-port'?: number | null
   /** 设备名称 —— 仅由绑定客户端（POST /api/device-bind）写入；管理表单只读展示，空 = 尚未绑定。 */
   'device-name': string
   /** 平台类型：'windows' | 'macos'（与 SB 路径列表平台类型同枚举）。 */
@@ -170,7 +173,7 @@ export interface DeviceDetail {
   pcname: string
   public_url: string
   port?: number
-  oc_port?: number
+  oc_port?: number | null
   username: string
   password: string
 }

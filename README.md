@@ -94,16 +94,21 @@ to devices (probe, project/session proxy) itself. This:
 - Users log in with `name + key` (the key is also the device-hop credential).
 - Devices are *grants*: the admin assigns tunnel service name + port; the device binds
   itself later via `POST /api/device-bind` (writes `device-name`, flips `bound`).
+- `public-url` is the device's tunnel address `http(s)://host[:port]` — an explicit
+  port is allowed (`ip:port` tunnel endpoints) and is then used as-is. `oc-port` is
+  optional: when set, browser jump URLs carry it as a path prefix
+  (`{public-url}/{oc-port}/…`); when empty, the jump URL is the bare tunnel address.
 - No caches: every request reads the registry straight from SilverBullet — a small
   user base makes TTL caches (and their staleness bugs) not worth it (ADR #20/#21).
 
 ### 4. Device state: one round-trip `/api/me`
 
 `GET /api/me` returns the user's devices **enriched with runtime status**: the BFF
-concurrently probes `{cloud_ip}:{port}/status` for every device (4s timeout each,
-`futures::join_all`, batched). The probe never fails the request — a dead device just
-comes back as `online:false, reason:"…"`, and the SPA renders red/orange/green dots
-from `available ∈ {-1, 0, 1}`.
+concurrently probes the TUI service address of every device (4s timeout each,
+`futures::join_all`, batched) — `{public-url}:{port}/status`, or the bare
+`{public-url}` when it carries its own port. The probe never fails the request — a
+dead device just comes back as `online:false, reason:"…"`, and the SPA renders
+red/orange/green dots from `available ∈ {-1, 0, 1}`.
 
 ### 5. Deep-link jump URLs (base64url, override priority)
 
@@ -113,9 +118,11 @@ from `available ∈ {-1, 0, 1}`.
 
 - `directory` is encoded as URL-safe base64 without padding, so Chinese/space paths
   survive every hop; the format is locked by unit tests (`jump.rs`, zero dependencies).
-- `base_url` priority: per-device override > user config > registry `public-url`.
-  An override only changes where the **browser** jumps; the BFF data path always goes
-  through `cloud_ip:port` (the server cannot reach a user's LAN).
+- `base_url` priority: per-device override > user config > registry `public-url`
+  composed as `{public-url}[/{oc-port}]` (path prefix; omitted when `oc-port`
+  is empty). An override only changes where the **browser** jumps; the BFF data
+  path always goes through the device's TUI tunnel address (the server cannot
+  reach a user's LAN).
 - `auth_token` (base64 of `user:pass`) is appended only on the LAN-fallback link to
   spare users the browser's native Basic-auth popup.
 - Open-redirect defense: jump targets must come from the registry/config union —

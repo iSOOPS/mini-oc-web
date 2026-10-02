@@ -67,10 +67,9 @@ pub fn cookie_key() -> Vec<u8> {
 }
 
 /// Default `public_url` baked into test device entries when a test doesn't
-/// supply its own — a portless loopback literal (ports live in the `port` /
-/// `oc-port` fields, matching what `migrate_device_urls` normalizes to), so
-/// load() performs no migration write-back and `me`/`device_status` probes
-/// hit `http://127.0.0.1:{port}` and fail fast (connection refused) instead
+/// supply its own — a portless loopback literal (the TUI port lives in the
+/// `port` field), so `me`/`device_status` probes hit
+/// `http://127.0.0.1:{port}` and fail fast (connection refused) instead
 /// of egressing to the real fleet.
 pub const TEST_DEFAULT_PUBLIC_URL: &str = "http://127.0.0.1";
 
@@ -122,10 +121,11 @@ pub fn host_of(uri: &str) -> String {
 
 /// User-registry variant with an explicit tunnel `public-url` (portless
 /// `scheme://host`) per device. The BFF composes its device URLs as
-/// `{public-url}:{port}` (TUI probe/API) and `{public-url}:{oc-port}`
-/// (opencode jump) — the mock port fills both roles so one wiremock
-/// server stands in for the whole device. `cloud_ip` is recorded too
-/// (device→cloud callback address; never a probe target).
+/// `{public-url}:{port}` (TUI probe/API, portless addresses) and
+/// `{public-url}/{oc-port}` (opencode jump, path prefix) — the mock port
+/// fills both roles so one wiremock server stands in for the whole
+/// device. `cloud_ip` is recorded too (device→cloud callback address;
+/// never a probe target).
 pub fn users_json_with_public_urls(cloud_ip: &str, name_uris: &[(&str, &str)]) -> String {
     serde_json::json!({
         "version": 1,

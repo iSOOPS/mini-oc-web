@@ -123,7 +123,8 @@ async fn jump_url_embeds_user_credentials_as_auth_token() {
 
     let expected = format!("auth_token={}", user_auth_token_query());
     assert!(jump.contains(&expected), "jump={} should contain {}", jump, expected);
-    assert!(jump.starts_with(&device.uri()), "jump={} should target the device", jump);
+    let base = format!("{}/{}", host_of(&device.uri()), port_of(&device.uri()));
+    assert!(jump.starts_with(&base), "jump={} should target the device", jump);
     assert!(jump.contains("/session/ses_abc"));
 }
 

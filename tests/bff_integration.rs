@@ -340,9 +340,12 @@ async fn device_create_session_returns_jump_url() {
     let body = body_json(resp).await;
     assert_eq!(body["id"], "sess-42");
     assert_eq!(body["directory"], "/work/api");
+    // Jump URL: tunnel address with the oc-port as a path prefix
+    // (`{public-url host}/{oc-port}/{b64}/session/...`).
     let expected_jump = format!(
-        "{}/{}/session/sess-42?auth_token={}",
-        device.uri(),
+        "{}/{}/{}/session/sess-42?auth_token={}",
+        host_of(&device.uri()),
+        port_of(&device.uri()),
         b64url("/work/api"),
         auth_token_query(TEST_USER_ID, TEST_KEY)
     );
